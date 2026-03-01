@@ -8,11 +8,14 @@ from typing import Any, Optional
 
 import httpx
 from fastapi import Body, FastAPI, HTTPException
+from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import os
+import subprocess
+import shlex
 
 app = FastAPI(title="A.D.A Web Admin", version="0.1.0")
 
@@ -88,6 +91,15 @@ class ChatHistoryBody(BaseModel):
 class LearnBody(BaseModel):
     key: str
     value: dict
+
+
+class FileWriteBody(BaseModel):
+    path: str
+    content: str
+    commit: bool = False
+    commit_message: Optional[str] = None
+    author_name: Optional[str] = None
+    author_email: Optional[str] = None
 
 
 @app.get("/health")
@@ -639,6 +651,85 @@ async def api_agent_credentials_post(body: CredentialsBody):
     if r.status_code >= 400:
         raise HTTPException(status_code=r.status_code, detail=r.text)
     return {"status": "ok", "platform": body.platform}
+
+
+def _is_within_repo(root: str, target: str) -> bool:
+    try:
+        root_p = os.path.realpath(root)
+        targ_p = os.path.realpath(target)
+        return os.path.commonpath([root_p]) == os.path.commonpath([root_p, targ_p])
+    except Exception:
+        return False
+
+
+@app.post("/api/fs/write")
+async def api_fs_write(body: FileWriteBody, request: Request):
+    """Permite escribir archivos dentro del workspace del proyecto.
+
+    Seguridad:
+    - Requiere que la variable de entorno `ENABLE_AGENT_FS` esté exactamente en '1' o 'true'.
+    - Valida que la ruta esté dentro del repo (no traversal fuera).
+    - Opcional: hace commit local si `commit=true`.
+    """
+    enabled = os.getenv("ENABLE_AGENT_FS", "0").lower() in ("1", "true", "yes")
+    if not enabled:
+        raise HTTPException(status_code=403, detail="Agent filesystem operations are disabled on this server.")
+
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    target_path = os.path.abspath(os.path.join(repo_root, body.path))
+
+    if not _is_within_repo(repo_root, target_path):
+        raise HTTPException(status_code=400, detail="Invalid path: outside of repository root")
+
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    try:
+        with open(target_path, "w", encoding="utf-8") as f:
+            f.write(body.content)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to write file: {str(e)}")
+
+    # Log the write operation to logging-system (best-effort)
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            await client.post(
+                LOG_URL + "/log",
+                json={
+                    "service_name": "web-admin",
+                    "event_type": "fs_write",
+                    "payload": {"path": body.path, "actor": "agent", "remote_addr": request.client.host if request.client else None},
+                },
+            )
+    except Exception:
+        pass
+
+    result = {"status": "ok", "path": body.path}
+
+    # Commits and any push to remote are disabled by default. To allow local git commits
+    # set environment variable ENABLE_AGENT_GIT_COMMIT to '1' or 'true'. This prevents
+    # accidental pushes to GitHub if the server is exposed.
+    git_commit_enabled = os.getenv("ENABLE_AGENT_GIT_COMMIT", "0").lower() in ("1", "true", "yes")
+    if body.commit:
+        if not git_commit_enabled:
+            result["committed"] = False
+            result["commit_error"] = "Commits are disabled on this server (ENABLE_AGENT_GIT_COMMIT is not set)."
+        else:
+            # Make a git commit (local). Use provided author metadata if present.
+            try:
+                subprocess.run(["git", "add", body.path], cwd=repo_root, check=True)
+                msg = body.commit_message or f"Agent update: {body.path}"
+                env = os.environ.copy()
+                if body.author_name:
+                    env["GIT_AUTHOR_NAME"] = body.author_name
+                if body.author_email:
+                    env["GIT_AUTHOR_EMAIL"] = body.author_email
+                subprocess.run(["git", "commit", "-m", msg], cwd=repo_root, check=True, env=env)
+                result["committed"] = True
+            except subprocess.CalledProcessError as e:
+                result["committed"] = False
+                result["commit_error"] = str(e)
+
+    return result
 
 
 @app.get("/api/agent/plan-history")

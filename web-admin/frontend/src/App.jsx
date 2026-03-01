@@ -7,6 +7,15 @@ const API = (path, options = {}) =>
   }).then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.statusText))))
 
 export default function App() {
+  const [theme, setTheme] = useState(() => {
+    try {
+      return localStorage.getItem('ada_theme') || 'dark'
+    } catch (e) { return 'dark' }
+  })
+
+  useEffect(() => {
+    try { document.documentElement.setAttribute('data-theme', theme); localStorage.setItem('ada_theme', theme) } catch (e) {}
+  }, [theme])
   const [balance, setBalance] = useState({ income: 0, expense: 0, balance: 0, can_use_paid_tools: false })
   const [events, setEvents] = useState([])
   const [chatMessage, setChatMessage] = useState('')
@@ -256,6 +265,16 @@ export default function App() {
       <section className="pane pane-left">
         <header className="pane-header">
           <h2><span className="badge badge-success">ADA</span> Tu socio</h2>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+              title="Cambiar tema"
+            >
+              {theme === 'dark' ? 'Modo claro' : 'Modo oscuro'}
+            </button>
+          </div>
           <div style={{ fontSize: '0.8rem', opacity: 0.6 }}>Opina, propone planes y explica el porqué de sus decisiones</div>
         </header>
 
