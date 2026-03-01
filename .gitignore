@@ -1,0 +1,7 @@
+# Variables de entorno con secretos (nunca subir)
+.env
+ada_resources.env
+# Venv del signup-helper (Playwright)
+signup-helper/venv
+# Backup de memoria (scripts/memory_export_import.sh)
+memory_backup/

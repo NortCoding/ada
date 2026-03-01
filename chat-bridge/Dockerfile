@@ -1,0 +1,12 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY src/ /app/
+ENV PYTHONPATH=/app
+EXPOSE 8081
+
+CMD ["python", "-m", "telegram_bot"]

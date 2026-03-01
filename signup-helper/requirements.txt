@@ -1,0 +1,2 @@
+# Registro asistido con el correo de A.D.A (ejecutar en tu PC, no en Docker)
+playwright>=1.40.0

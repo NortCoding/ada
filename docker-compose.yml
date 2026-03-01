@@ -1,0 +1,206 @@
+# A.D.A — F0 a F5 (MVP operativo)
+# Modo núcleo (por defecto): postgres + agent-core. Ollama nativo en el host (Mac mini / Mac: host.docker.internal).
+# Modo completo: docker compose --profile extended up -d (añade logging, policy, simulation, task-runner, financial-ledger, memory-db, web-admin, n8n).
+# Uso mínimo: docker compose up -d
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: ada_postgres
+    environment:
+      POSTGRES_USER: ${PG_USER:-ada_user}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-supersecret}
+      POSTGRES_DB: ${PG_DB:-ada_main}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./infra/postgres/schemas:/docker-entrypoint-initdb.d
+    ports:
+      - "${PG_PORT:-5432}:5432"
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${PG_USER:-ada_user} -d ${PG_DB:-ada_main}" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  logging-system:
+    build: ./logging-system
+    container_name: ada_logging
+    profiles:
+      - extended
+    environment:
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_USER: ${PG_USER:-ada_user}
+      PG_PASSWORD: ${PG_PASSWORD:-supersecret}
+      PG_DB: ${PG_DB:-ada_main}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "3006:3006"
+
+  policy-engine:
+    build: ./policy-engine
+    container_name: ada_policy
+    profiles:
+      - extended
+    environment:
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_USER: ${PG_USER:-ada_user}
+      PG_PASSWORD: ${PG_PASSWORD:-supersecret}
+      PG_DB: ${PG_DB:-ada_main}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "3008:3008"
+
+  simulation-engine:
+    build: ./simulation-engine
+    container_name: ada_simulation
+    profiles:
+      - extended
+    ports:
+      - "3007:3007"
+
+  task-runner:
+    build: ./task-runner
+    container_name: ada_task_runner
+    profiles:
+      - extended
+    environment:
+      LOG_URL: http://logging-system:3006/log
+    depends_on:
+      - logging-system
+    ports:
+      - "3003:3003"
+
+  agent-core:
+    build: ./agent-core
+    container_name: ada_agent_core
+    env_file: ada_resources.env
+    environment:
+      SIM_URL: http://simulation-engine:3007/simulate
+      POLICY_URL: http://policy-engine:3008/approve
+      LOG_URL: http://logging-system:3006/log
+      TASK_URL: http://task-runner:3003/execute
+      MEMORY_URL: http://memory-db:3005
+      LEDGER_URL: http://financial-ledger:3004
+      # Ollama nativo en el host. En Mac (Mac mini): host.docker.internal. No definir OLLAMA_URL salvo que Ollama esté en otra URL.
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434/api/generate}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2}
+      # Cerebro externo gratuito: Google Gemini (key desde env_file: ada_resources.env).
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.0-flash}
+      # Moltbot
+      MOLTBOT_URL: ${MOLTBOT_URL:-http://moltbot:3010/execute}
+      ADA_EMAIL: ${ADA_EMAIL:-}
+      ADA_EMAIL_PASSWORD: ${ADA_EMAIL_PASSWORD:-}
+      ADA_ENV: ${ADA_ENV:-production}
+      # Telegram: cuando ADA necesita ayuda envía mensaje (chat-bridge /send). Definir en .env para activar.
+      CHAT_BRIDGE_URL: ${CHAT_BRIDGE_URL:-http://chat-bridge:8081}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      # Workspace: todo el proyecto (backend y frontend) para que ADA pueda leer/escribir
+      ADA_WORKSPACE: ${ADA_WORKSPACE:-/workspace}
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./agent-core/src:/app
+      - .:/workspace
+
+  financial-ledger:
+    build: ./financial-ledger
+    container_name: ada_financial_ledger
+    profiles:
+      - extended
+    environment:
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_USER: ${PG_USER:-ada_user}
+      PG_PASSWORD: ${PG_PASSWORD:-supersecret}
+      PG_DB: ${PG_DB:-ada_main}
+      LOG_URL: http://logging-system:3006/log
+    depends_on:
+      postgres:
+        condition: service_healthy
+      logging-system:
+        condition: service_started
+    ports:
+      - "3004:3004"
+
+  memory-db:
+    build: ./memory-db
+    container_name: ada_memory_db
+    profiles:
+      - extended
+    environment:
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_USER: ${PG_USER:-ada_user}
+      PG_PASSWORD: ${PG_PASSWORD:-supersecret}
+      PG_DB: ${PG_DB:-ada_main}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "3005:3005"
+
+  web-admin:
+    build: ./web-admin
+    container_name: ada_web_admin
+    profiles:
+      - extended
+    environment:
+      AGENT_URL: http://agent-core:3001
+      MEMORY_URL: http://memory-db:3005
+      LEDGER_URL: http://financial-ledger:3004
+      LOG_URL: http://logging-system:3006
+    depends_on:
+      - agent-core
+      - memory-db
+      - financial-ledger
+      - logging-system
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./web-admin/src:/app
+      - ./web-admin/frontend/dist:/frontend/dist
+
+  chat-bridge:
+    build: ./chat-bridge
+    container_name: ada_chat_bridge
+    environment:
+      AGENT_URL: http://agent-core:3001
+      LOG_URL: http://logging-system:3006
+      MEMORY_URL: http://memory-db:3005
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    depends_on:
+      - agent-core
+      - logging-system
+    ports:
+      - "8081:8081"
+    profiles:
+      - telegram
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: ada_n8n
+    profiles:
+      - extended
+    restart: always
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_HOST=localhost
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - NODE_ENV=production
+      - WEBHOOK_URL=http://localhost:5678/
+      - GENERIC_TIMEZONE=Europe/Madrid
+    volumes:
+      - n8n-data:/home/node/.n8n
+
+volumes:
+  pg-data:
+  n8n-data:

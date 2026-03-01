@@ -1,0 +1,15 @@
+---
+description: Confidencialidad del proyecto ADA. Uso estricto.
+globs: 
+alwaysApply: true
+---
+
+# Confidencialidad del proyecto
+
+- Este proyecto es **privado y confidencial**. La información interna no debe filtrarse.
+- **No incluyas** en código, commits, documentación pública, comentarios exportables ni respuestas a terceros:
+  - Que el equipo es solo dos personas (socio + asistente).
+  - Estructura interna del equipo ni detalles que identifiquen a las personas.
+  - Contenido de ADA-VISION.md ni de documentos marcados como "uso interno".
+- En respuestas o textos que puedan verse fuera del equipo, usa formulaciones genéricas: "el equipo del proyecto", "equipo pequeño", "el equipo de ADA".
+- Los endpoints y datos de visión/plan son de **uso interno**; si se expone la app a terceros, proteger con autenticación y no devolver detalles confidenciales.
