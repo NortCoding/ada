@@ -29,11 +29,15 @@ app.add_middleware(
 
 AGENT_URL = os.getenv("AGENT_URL", "http://agent-core:3001").rstrip("/")
 MEMORY_URL = os.getenv("MEMORY_URL", "http://memory-db:3005").rstrip("/")
-LEDGER_URL = os.getenv("LEDGER_URL", "http://financial-ledger:3004").rstrip("/")
-LOG_URL = os.getenv("LOG_URL", "http://logging-system:3006").rstrip("/")
+LEDGER_URL = (os.getenv("LEDGER_URL") or "").strip().rstrip("/")
+LOG_URL = (os.getenv("LOG_URL") or "").strip().rstrip("/")
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "30"))
 # Chat puede tardar más (agent-core espera a Ollama hasta OLLAMA_CHAT_TIMEOUT)
 CHAT_REQUEST_TIMEOUT = float(os.getenv("CHAT_REQUEST_TIMEOUT", "180"))
+
+# In-memory flag to represent human-initiated "connected" state in the web-admin UI.
+# This is only for UI convenience; real connectivity is validated via /agent/health pings.
+AGENT_CONNECTED = False
 
 
 # --- Proxy API (para el frontend y para pruebas) ---
@@ -76,6 +80,7 @@ class ChatBody(BaseModel):
     message: str = ""
     use_ollama: bool = True
     history: Optional[list[ChatMessageBody]] = None
+    image_base64: Optional[str] = None  # Imagen en base64 para que ADA pueda leer (vision)
 
 
 class ChatHistoryItem(BaseModel):
@@ -149,7 +154,9 @@ async def api_memory_keys(prefix: str = ""):
 
 @app.post("/api/ledger/transaction")
 async def api_ledger_transaction(body: TransactionBody):
-    """Proxy a financial-ledger POST /transaction."""
+    """Proxy a financial-ledger POST /transaction. 503 si ledger no está configurado."""
+    if not LEDGER_URL:
+        raise HTTPException(status_code=503, detail="financial-ledger no configurado")
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         r = await client.post(f"{LEDGER_URL}/transaction", json=body.model_dump())
     if r.status_code >= 400:
@@ -159,7 +166,9 @@ async def api_ledger_transaction(body: TransactionBody):
 
 @app.get("/api/ledger/transactions")
 async def api_ledger_transactions(limit: int = 100):
-    """Proxy a financial-ledger GET /transactions."""
+    """Proxy a financial-ledger GET /transactions. Lista vacía si no está configurado."""
+    if not LEDGER_URL:
+        return {"transactions": []}
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         r = await client.get(f"{LEDGER_URL}/transactions", params={"limit": limit})
     if r.status_code >= 400:
@@ -169,12 +178,18 @@ async def api_ledger_transactions(limit: int = 100):
 
 @app.get("/api/balance")
 async def api_balance():
-    """Proxy a financial-ledger GET /balance."""
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        r = await client.get(f"{LEDGER_URL}/balance")
-    if r.status_code >= 400:
-        raise HTTPException(status_code=r.status_code, detail=r.text)
-    return r.json()
+    """Proxy a financial-ledger GET /balance. Si no está configurado o no está disponible, devuelve ceros."""
+    default = {"income": 0, "expense": 0, "balance": 0, "can_use_paid_tools": False}
+    if not LEDGER_URL:
+        return default
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            r = await client.get(f"{LEDGER_URL}/balance")
+        if r.status_code >= 400:
+            return default
+        return r.json()
+    except Exception:
+        return default
 
 
 @app.get("/api/agent/health")
@@ -216,16 +231,24 @@ async def api_chat_history_save(body: ChatHistoryBody):
 
 @app.post("/api/chat")
 async def api_chat(body: ChatBody):
-    """Envía mensaje a A.D.A → agent-core /chat (con historial opcional). Nunca devuelve 500: si falla, responde 200 con mensaje de error en el chat."""
+    """Envía mensaje a A.D.A. Usa el chat clásico /chat (herramientas de archivos, plan antes de ejecutar, visión con imagen)."""
     try:
-        payload = {"message": getattr(body, "message", "") or "", "use_ollama": getattr(body, "use_ollama", True)}
-        if getattr(body, "history", None):
-            payload["history"] = [{"role": getattr(h, "role", "user"), "content": getattr(h, "content", "") or getattr(h, "text", "")} for h in body.history]
+        message = getattr(body, "message", "") or ""
+        history = getattr(body, "history", None)
+        history_payload = [{"role": getattr(h, "role", "user"), "content": getattr(h, "content", "") or getattr(h, "text", "")} for h in history] if history else None
+        image_base64 = getattr(body, "image_base64", None)
+
+        payload = {"message": message, "use_ollama": getattr(body, "use_ollama", True), "history": history_payload}
+        if image_base64:
+            payload["image_base64"] = image_base64
         async with httpx.AsyncClient(timeout=CHAT_REQUEST_TIMEOUT) as client:
             r = await client.post(f"{AGENT_URL}/chat", json=payload)
+
         if r.status_code == 200:
-            return r.json()
-        # Si agent-core devuelve error, no propagar 500: devolver 200 con mensaje para el chat
+            data = r.json()
+            if "response" in data and "status" not in data:
+                data.setdefault("status", "done")
+            return data
         try:
             data = r.json()
             msg = data.get("response") or data.get("detail") or r.text[:500]
@@ -235,9 +258,112 @@ async def api_chat(body: ChatBody):
     except httpx.TimeoutException:
         return {"response": "**Tiempo de espera agotado.** ADA (Ollama) tarda demasiado. Vuelve a intentar o revisa que Ollama esté activo.", "status": "error"}
     except httpx.ConnectError:
-        return {"response": "**No se pudo conectar a ADA.** Revisa que agent-core esté en marcha: `docker compose up -d agent-core`.", "status": "error"}
+        return {"response": "**No se pudo conectar a ADA.** Revisa que agent-core esté en marcha: `docker compose up -d ada_core`.", "status": "error"}
     except Exception as e:
-        return {"response": f"**Error al enviar el mensaje.** {str(e)[:300]}\n\nSi sigue fallando, revisa los logs: `docker logs ada_agent_core`.", "status": "error"}
+        return {"response": f"**Error al enviar el mensaje.** {str(e)[:300]}\n\nSi sigue fallando, revisa los logs: `docker logs ada_core`.", "status": "error"}
+
+
+@app.post("/api/execute_plan")
+async def api_execute_plan(body: dict):
+    """Ejecuta un plan de acciones devuelto por ADA (cuando status es pending_plan). Body: { \"plan\": [...] }."""
+    plan = body.get("plan") or body.get("pending_plan")
+    if not plan:
+        raise HTTPException(status_code=400, detail="Falta 'plan' en el body.")
+    async with httpx.AsyncClient(timeout=CHAT_REQUEST_TIMEOUT) as client:
+        r = await client.post(f"{AGENT_URL}/execute_plan", json={"plan": plan})
+    if r.status_code >= 400:
+        return {"status": "error", "detail": r.text[:500], "results": []}
+    return r.json()
+
+
+# --- Proxies ADA v2/v3 (herramientas: objetivos, investigación, auto-mejora, oportunidades, planes, aprendizaje) ---
+class AdaGoalBody(BaseModel):
+    goal: str
+
+
+class AdaResearchBody(BaseModel):
+    goal: str
+    context: str = ""
+
+
+@app.get("/api/ada/v2/goals")
+async def api_ada_v2_goals():
+    """Lista objetivos activos de ADA (v2)."""
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        r = await client.get(f"{AGENT_URL}/v2/goals")
+    if r.status_code >= 400:
+        return {"goals": []}
+    return r.json()
+
+
+@app.post("/api/ada/v2/goals")
+async def api_ada_v2_add_goal(body: AdaGoalBody):
+    """Añade un objetivo para que ADA lo trabaje en segundo plano (v2)."""
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        r = await client.post(f"{AGENT_URL}/v2/goals", json={"goal": body.goal})
+    if r.status_code >= 400:
+        raise HTTPException(status_code=r.status_code, detail=r.text)
+    return r.json()
+
+
+@app.get("/api/ada/v2/self-improvement")
+async def api_ada_v2_self_improvement():
+    """Análisis de cuellos de botella y sugerencias de mejora del sistema (v2)."""
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        r = await client.get(f"{AGENT_URL}/v2/self-improvement")
+    if r.status_code >= 400:
+        return {"analysis": "No disponible (revisa que agent-core esté en marcha)."}
+    return r.json()
+
+
+@app.post("/api/ada/v2/research")
+async def api_ada_v2_research(body: AdaResearchBody):
+    """Investiga un objetivo: análisis y estrategias (v2)."""
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        r = await client.post(f"{AGENT_URL}/v2/research", json={"goal": body.goal, "context": body.context})
+    if r.status_code >= 400:
+        return {"analysis": r.text[:2000] if r.text else "Error en investigación."}
+    return r.json()
+
+
+@app.get("/api/ada/v3/opportunities/top")
+async def api_ada_v3_opportunities_top():
+    """Oportunidades mejor puntuadas (v3)."""
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        r = await client.get(f"{AGENT_URL}/v3/opportunities/top")
+    if r.status_code >= 400:
+        return {"opportunities": []}
+    return r.json()
+
+
+@app.get("/api/ada/v3/plans")
+async def api_ada_v3_plans():
+    """Planes de acción generados por ADA (v3)."""
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        r = await client.get(f"{AGENT_URL}/v3/plans")
+    if r.status_code >= 400:
+        return {"plans": [], "from_table": False}
+    return r.json()
+
+
+@app.get("/api/ada/v3/learning")
+async def api_ada_v3_learning():
+    """Aprendizajes recientes (experiencias evaluadas) (v3)."""
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        r = await client.get(f"{AGENT_URL}/v3/learning")
+    if r.status_code >= 400:
+        return {"learning": []}
+    return r.json()
+
+
+@app.post("/api/ada/v3/research")
+async def api_ada_v3_research(body: AdaResearchBody):
+    """Investiga un objetivo (v3)."""
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        r = await client.post(f"{AGENT_URL}/v3/research", json={"goal": body.goal, "context": body.context})
+    if r.status_code >= 400:
+        return {"analysis": r.text[:2000] if r.text else "Error en investigación."}
+    return r.json()
 
 
 async def _register_human_decision(
@@ -277,25 +403,28 @@ async def api_approve(body: ApproveBody):
 
 @app.post("/api/reject")
 async def api_reject(body: RejectBody):
-    """Rechazo humano: registrar en logging y en memory-db (human_decisions). Comentario opcional."""
+    """Rechazo humano: registrar en logging (si está) y en memory-db (human_decisions). Comentario opcional."""
     payload = {"proposal": body.proposal, "reason": body.reason}
     if body.comment:
         payload["comment"] = body.comment
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        r = await client.post(
-            LOG_URL + "/log",
-            json={
-                "service_name": "web-admin",
-                "event_type": "human_rejected",
-                "payload": payload,
-            },
-        )
-    if r.status_code >= 400:
-        raise HTTPException(status_code=r.status_code, detail=r.text)
+    log_res = None
+    if LOG_URL:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            r = await client.post(
+                LOG_URL + "/log",
+                json={
+                    "service_name": "web-admin",
+                    "event_type": "human_rejected",
+                    "payload": payload,
+                },
+            )
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        log_res = r.json()
     await _register_human_decision(
         body.proposal, "rejected", reason=body.reason, comment=body.comment
     )
-    return r.json()
+    return log_res if log_res is not None else {"status": "ok"}
 
 
 @app.post("/api/learn")
@@ -324,17 +453,22 @@ async def api_resimulate(body: ProposalBody):
 
 @app.get("/api/events")
 async def api_events(limit: int = 50, event_type: Optional[str] = None, service_name: Optional[str] = None):
-    """Eventos recientes (logs) desde logging-system."""
+    """Eventos recientes (logs) desde logging-system. Si no está configurado o no disponible, lista vacía."""
+    if not LOG_URL:
+        return {"events": []}
     params: dict = {"limit": limit}
     if event_type:
         params["event_type"] = event_type
     if service_name:
         params["service_name"] = service_name
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        r = await client.get(f"{LOG_URL}/events", params=params)
-    if r.status_code >= 400:
-        raise HTTPException(status_code=r.status_code, detail=r.text)
-    return r.json()
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            r = await client.get(f"{LOG_URL}/events", params=params)
+        if r.status_code >= 400:
+            return {"events": []}
+        return r.json()
+    except Exception:
+        return {"events": []}
 
 
 @app.get("/api/score")
@@ -576,23 +710,58 @@ async def api_agent_status():
             r_cap = await client.get(f"{AGENT_URL}/autonomous/capabilities")
             if r_cap.status_code == 200:
                 status["capabilities"] = r_cap.json()
-            r_events = await client.get(f"{LOG_URL}/events", params={"limit": 20, "service_name": "agent-core"})
-            if r_events.status_code == 200:
-                events = (r_events.json() or {}).get("events") or []
-                for ev in reversed(events):
-                    if (ev.get("event_type") or "").startswith("plan_step_started"):
-                        p = ev.get("payload") or {}
-                        status["step_in_execution"] = p.get("step_index")
-                        status["state"] = "executing"
-                        break
-                    if (ev.get("event_type") or "").startswith("plan_step_needs_help"):
-                        status["state"] = "needs_human"
-                        break
+            if LOG_URL:
+                r_events = await client.get(f"{LOG_URL}/events", params={"limit": 20, "service_name": "agent-core"})
+                if r_events.status_code == 200:
+                    events = (r_events.json() or {}).get("events") or []
+                    for ev in reversed(events):
+                        if (ev.get("event_type") or "").startswith("plan_step_started"):
+                            p = ev.get("payload") or {}
+                            status["step_in_execution"] = p.get("step_index")
+                            status["state"] = "executing"
+                            break
+                        if (ev.get("event_type") or "").startswith("plan_step_needs_help"):
+                            status["state"] = "needs_human"
+                            break
             if status["plan"] and status["state"] == "idle" and status["progress_percent"] < 100:
                 status["state"] = "ready"
         except Exception:
             pass
     return {"status": "ok", **status}
+
+
+@app.post("/api/agent/connect")
+async def api_agent_connect(connect: bool = True):
+    """Conectar o desconectar la indicación de conexión a agent-core.
+
+    - Si `connect=true`, hace un ping a `agent-core /health` y marca `AGENT_CONNECTED`.
+    - Si `connect=false`, marca `AGENT_CONNECTED = False`.
+    Esto no crea conexiones persistentes en el servidor; solo facilita control desde la UI.
+    """
+    global AGENT_CONNECTED
+    if connect:
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                r = await client.get(f"{AGENT_URL}/health")
+            ok = r.status_code == 200
+            AGENT_CONNECTED = ok
+            try:
+                data = r.json() if ok else {"text": r.text}
+            except Exception:
+                data = {"text": r.text}
+            return {"connected": ok, "agent": data}
+        except Exception as e:
+            AGENT_CONNECTED = False
+            return {"connected": False, "error": str(e)}
+    else:
+        AGENT_CONNECTED = False
+        return {"connected": False}
+
+
+@app.get("/api/agent/connect")
+async def api_agent_connect_get():
+    """Devuelve el estado actual del indicador de conexión (no garantiza reachability)."""
+    return {"connected": AGENT_CONNECTED}
 
 
 @app.post("/api/agent/update")
@@ -662,6 +831,46 @@ def _is_within_repo(root: str, target: str) -> bool:
         return False
 
 
+def _get_repo_root() -> str:
+    """Raíz para el explorador de archivos. Si ADA_FILES_ROOT está definido (ej. /dockers en Docker), se usa esa ruta."""
+    files_root = (os.getenv("ADA_FILES_ROOT") or "").strip()
+    if files_root:
+        return os.path.abspath(files_root)
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+
+@app.get("/api/fs/list")
+async def api_fs_list(path: str = ""):
+    """Lista el contenido de un directorio. path relativo a la raíz (ADA_FILES_ROOT o repo)."""
+    repo_root = _get_repo_root()
+    rel = (path or ".").strip().strip("/")
+    if rel == ".":
+        rel = ""
+    target_dir = os.path.normpath(os.path.join(repo_root, rel) if rel else repo_root)
+    if not os.path.isdir(target_dir):
+        raise HTTPException(status_code=404, detail="Not a directory")
+    if not _is_within_repo(repo_root, target_dir):
+        raise HTTPException(status_code=403, detail="Path outside repository")
+    try:
+        names = sorted(os.listdir(target_dir))
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    entries = []
+    for name in names:
+        if name.startswith(".") and name not in (".cursor", ".env", ".git"):
+            continue
+        full = os.path.join(target_dir, name)
+        try:
+            is_dir = os.path.isdir(full)
+        except OSError:
+            continue
+        rel_path = os.path.join(rel, name).replace("\\", "/") if rel else name
+        entries.append({"name": name, "path": rel_path, "is_dir": is_dir})
+    # Carpetas primero, luego archivos
+    entries.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
+    return {"path": rel or ".", "entries": entries}
+
+
 @app.post("/api/fs/write")
 async def api_fs_write(body: FileWriteBody, request: Request):
     """Permite escribir archivos dentro del workspace del proyecto.
@@ -675,7 +884,7 @@ async def api_fs_write(body: FileWriteBody, request: Request):
     if not enabled:
         raise HTTPException(status_code=403, detail="Agent filesystem operations are disabled on this server.")
 
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    repo_root = _get_repo_root()
     target_path = os.path.abspath(os.path.join(repo_root, body.path))
 
     if not _is_within_repo(repo_root, target_path):
@@ -689,19 +898,20 @@ async def api_fs_write(body: FileWriteBody, request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to write file: {str(e)}")
 
-    # Log the write operation to logging-system (best-effort)
-    try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            await client.post(
-                LOG_URL + "/log",
-                json={
-                    "service_name": "web-admin",
-                    "event_type": "fs_write",
-                    "payload": {"path": body.path, "actor": "agent", "remote_addr": request.client.host if request.client else None},
-                },
-            )
-    except Exception:
-        pass
+    # Log the write operation to logging-system (best-effort, solo si está configurado)
+    if LOG_URL:
+        try:
+            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+                await client.post(
+                    LOG_URL + "/log",
+                    json={
+                        "service_name": "web-admin",
+                        "event_type": "fs_write",
+                        "payload": {"path": body.path, "actor": "agent", "remote_addr": request.client.host if request.client else None},
+                    },
+                )
+        except Exception:
+            pass
 
     result = {"status": "ok", "path": body.path}
 
@@ -734,7 +944,9 @@ async def api_fs_write(body: FileWriteBody, request: Request):
 
 @app.get("/api/agent/plan-history")
 async def api_agent_plan_history(limit: int = 20):
-    """Planes anteriores a partir de eventos (autonomous_plan_created, plan_cleared). Logs históricos persistidos."""
+    """Planes anteriores a partir de eventos (autonomous_plan_created, plan_cleared). Lista vacía si logging no está."""
+    if not LOG_URL:
+        return {"status": "ok", "history": []}
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         r = await client.get(f"{LOG_URL}/events", params={"limit": limit * 2, "service_name": "agent-core"})
     if r.status_code != 200:

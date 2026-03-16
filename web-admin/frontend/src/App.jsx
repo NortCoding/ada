@@ -1,10 +1,151 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react'
+import SyntaxHighlighter from 'react-syntax-highlighter'
+import { dracula } from 'react-syntax-highlighter/dist/esm/styles/hljs'
 
 const API = (path, options = {}) =>
   fetch(path.startsWith('http') ? path : `/api${path}`, {
     headers: { 'Content-Type': 'application/json', ...options.headers },
     ...options,
   }).then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.statusText))))
+
+function toMessageString (v) {
+  if (v == null) return ''
+  if (typeof v === 'string') return v === '[object Object]' ? '' : v
+  if (typeof v === 'object' && v !== null && typeof v.message === 'string') return v.message
+  if (typeof v === 'object' && v !== null && typeof v.detail === 'string') return v.detail
+  const s = String(v)
+  return s === '[object Object]' ? '' : s
+}
+
+/** Parsea texto con bloques ```lang\ncode\n```; devuelve [{ type: 'text'|'code', content, language? }] */
+function parseMessageWithCodeBlocks(text) {
+  if (!text || typeof text !== 'string') return [{ type: 'text', content: '' }]
+  const segments = []
+  let rest = text
+  const re = /```(\w*)\n([\s\S]*?)```/g
+  let m
+  let lastIndex = 0
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > lastIndex) segments.push({ type: 'text', content: text.slice(lastIndex, m.index) })
+    const lang = (m[1] || '').trim().toLowerCase() || 'text'
+    const code = (m[2] || '').trimEnd()
+    if (code) segments.push({ type: 'code', content: code, language: lang })
+    lastIndex = re.lastIndex
+  }
+  if (lastIndex < text.length) segments.push({ type: 'text', content: text.slice(lastIndex) })
+  if (segments.length === 0) return [{ type: 'text', content: text }]
+  return segments
+}
+
+/** Etiqueta legible por tipo de archivo / lenguaje */
+function codeBlockLabel(lang) {
+  const map = { html: 'HTML', css: 'CSS', js: 'JavaScript', javascript: 'JavaScript', jsx: 'JSX', ts: 'TypeScript', tsx: 'TSX', py: 'Python', json: 'JSON', md: 'Markdown', sh: 'Shell', sql: 'SQL', yaml: 'YAML', yml: 'YAML' }
+  return map[lang] || (lang ? lang.toUpperCase() : 'Code')
+}
+
+const HIGHLIGHT_LANG = { js: 'javascript', javascript: 'javascript', jsx: 'jsx', ts: 'typescript', tsx: 'tsx', py: 'python', html: 'html', css: 'css', json: 'json', md: 'markdown', sh: 'bash', sql: 'sql', yaml: 'yaml', yml: 'yaml' }
+
+/** Explorador de archivos: árbol de directorios del workspace */
+function FileExplorer({ expanded, onToggle, cache, loadingPath, onSelect, selectedPath, onFetch }) {
+  const loadRoot = () => {
+    if (!cache['']) onFetch('')
+  }
+  React.useEffect(loadRoot, [])
+
+  function renderEntries(relPath) {
+    const entries = cache[relPath]
+    if (!entries) return null
+    return entries.map((e) => {
+      const path = relPath ? `${relPath}/${e.name}` : e.name
+      const isExpanded = expanded.has(path)
+      const isSelected = selectedPath === path
+      if (e.is_dir) {
+        const hasChildren = isExpanded && cache[path]
+        return (
+          <div key={path} className="file-tree-folder">
+            <button
+              type="button"
+              className={`file-tree-row ${isSelected ? 'selected' : ''}`}
+              onClick={() => {
+                onToggle(path)
+                if (!cache[path]) onFetch(path)
+              }}
+              style={{ paddingLeft: (path.split('/').length - 1) * 12 + 8 }}
+            >
+              <span className="file-tree-chevron">{isExpanded ? '▼' : '▶'}</span>
+              <span className="file-tree-icon file-tree-icon-folder">📁</span>
+              <span className="file-tree-label">{e.name}</span>
+            </button>
+            {hasChildren && (
+              <div className="file-tree-children">
+                {renderEntries(path)}
+              </div>
+            )}
+            {isExpanded && loadingPath === path && (
+              <div className="file-tree-loading" style={{ paddingLeft: path.split('/').length * 12 + 8 }}>Cargando…</div>
+            )}
+          </div>
+        )
+      }
+      const ext = (e.name.split('.').pop() || '').toLowerCase()
+      const icon = [ 'py', 'js', 'jsx', 'ts', 'tsx', 'json', 'md', 'yml', 'yaml' ].includes(ext) ? '📄' : '📄'
+      return (
+        <button
+          key={path}
+          type="button"
+          className={`file-tree-row file-tree-file ${isSelected ? 'selected' : ''}`}
+          style={{ paddingLeft: (path.split('/').length - 1) * 12 + 8 }}
+          onClick={() => onSelect(path)}
+        >
+          <span className="file-tree-chevron file-tree-chevron-placeholder" />
+          <span className="file-tree-icon">{icon}</span>
+          <span className="file-tree-label">{e.name}</span>
+        </button>
+      )
+    })
+  }
+
+  return (
+    <div className="file-tree">
+      <div className="file-tree-root">{renderEntries('')}</div>
+    </div>
+  )
+}
+
+function ChatCodeBlock({ content, language }) {
+  const [copied, setCopied] = useState(false)
+  const copy = () => {
+    navigator.clipboard.writeText(content).then(() => { setCopied(true); setTimeout(() => setCopied(false), 2000) }).catch(() => {})
+  }
+  const label = codeBlockLabel(language)
+  const highlightLang = HIGHLIGHT_LANG[language] || language || 'text'
+  return (
+    <div className="chat-code-block">
+      <div className="chat-code-block-header">
+        <span className="chat-code-block-lang">{label}</span>
+        <button type="button" className="chat-code-block-copy" onClick={copy} title="Copiar" aria-label="Copiar">
+          {copied ? (
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+          ) : (
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          )}
+        </button>
+      </div>
+      <div className="chat-code-block-body">
+        <SyntaxHighlighter
+          language={highlightLang}
+          style={dracula}
+          customStyle={{ margin: 0, padding: '0.75rem 1rem', background: 'transparent', fontSize: '0.85rem', lineHeight: 1.45 }}
+          codeTagProps={{ style: { fontFamily: 'var(--font-mono)' } }}
+          showLineNumbers={false}
+          PreTag="pre"
+        >
+          {content}
+        </SyntaxHighlighter>
+      </div>
+    </div>
+  )
+}
 
 export default function App() {
   const [theme, setTheme] = useState(() => {
@@ -19,6 +160,7 @@ export default function App() {
   const [balance, setBalance] = useState({ income: 0, expense: 0, balance: 0, can_use_paid_tools: false })
   const [events, setEvents] = useState([])
   const [chatMessage, setChatMessage] = useState('')
+  const [chatImageBase64, setChatImageBase64] = useState(null) // Imagen para que ADA la lea (vision)
   const [chatHistory, setChatHistory] = useState([
     { role: 'ada', text: 'Hola, soy A.D.A. Actúo como tu socio: doy mi opinión, propongo planes y explico el porqué de mis decisiones. ¿Sobre qué quieres que hablemos?' }
   ])
@@ -28,6 +170,7 @@ export default function App() {
   const [needsHelp, setNeedsHelp] = useState({ steps: [], platforms: [] })
   const [plan, setPlan] = useState(null) // plan actual + avances
   const [agentStatus, setAgentStatus] = useState(null) // estado agregado para Panel
+  const [agentConnected, setAgentConnected] = useState(false)
   const [planHistory, setPlanHistory] = useState([]) // planes anteriores
   const [brainConsoleEntries, setBrainConsoleEntries] = useState([])
   const [ollamaStatus, setOllamaStatus] = useState({ reachable: false, model_ready: false, error: '', models_available: [] })
@@ -36,6 +179,53 @@ export default function App() {
   const chatEndRef = useRef(null)
   const chatAbortRef = useRef(null)
   const chatTimeoutRef = useRef(null)
+  const chatInputRef = useRef(null)
+  const recognitionRef = useRef(null)
+  const speakResponseRef = useRef(false)
+  const lastSendWasVoiceRef = useRef(false)
+  const silenceTimeoutRef = useRef(null)
+  const voiceConversationModeRef = useRef(false)
+
+  const [voiceListening, setVoiceListening] = useState(false)
+  const [voiceInterimText, setVoiceInterimText] = useState('')
+  const [pendingVoiceSend, setPendingVoiceSend] = useState('')
+  const [voiceConversationMode, setVoiceConversationMode] = useState(() => {
+    try { return localStorage.getItem('ada_voice_conversation') === '1' } catch (e) { return true }
+  })
+  const [adaToolsOpen, setAdaToolsOpen] = useState(false)
+  const [adaToolsResult, setAdaToolsResult] = useState(null)
+  const [adaToolsLoading, setAdaToolsLoading] = useState(false)
+  const [pendingPlan, setPendingPlan] = useState(null)
+  const [speakResponse, setSpeakResponse] = useState(() => {
+    try { return localStorage.getItem('ada_speak_response') === '1' } catch (e) { return false }
+  })
+  useEffect(() => { speakResponseRef.current = speakResponse; try { localStorage.setItem('ada_speak_response', speakResponse ? '1' : '0') } catch (e) {} }, [speakResponse])
+  useEffect(() => { voiceConversationModeRef.current = voiceConversationMode; try { localStorage.setItem('ada_voice_conversation', voiceConversationMode ? '1' : '0') } catch (e) {} }, [voiceConversationMode])
+
+  const [fileExplorerExpanded, setFileExplorerExpanded] = useState(() => new Set())
+  const [fileExplorerCache, setFileExplorerCache] = useState({})
+  const [fileExplorerLoadingPath, setFileExplorerLoadingPath] = useState(null)
+  const [selectedFilePath, setSelectedFilePath] = useState(null)
+  const fileExplorerToggle = useCallback((path) => {
+    setFileExplorerExpanded((prev) => {
+      const next = new Set(prev)
+      if (next.has(path)) next.delete(path)
+      else next.add(path)
+      return next
+    })
+  }, [])
+  const fileExplorerFetch = useCallback((path) => {
+    if (fileExplorerCache[path] != null) return
+    setFileExplorerLoadingPath(path)
+    const q = path ? `?path=${encodeURIComponent(path)}` : ''
+    fetch(`/api/fs/list${q}`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.statusText))))
+      .then((data) => {
+        setFileExplorerCache((c) => ({ ...c, [data.path === '.' ? '' : data.path]: data.entries || [] }))
+      })
+      .catch(() => setFileExplorerCache((c) => ({ ...c, [path]: [] })))
+      .finally(() => setFileExplorerLoadingPath(null))
+  }, [fileExplorerCache])
 
   const scrollToBottom = () => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -83,6 +273,33 @@ export default function App() {
     API('/agent/status').then(setAgentStatus).catch(() => setAgentStatus(null))
   }, [])
 
+  // Conectar / desconectar ADA (ping a backend) y polling cuando esté conectada
+  const connectAgent = useCallback(async (connect) => {
+    try {
+      const res = await API('/agent/connect', {
+        method: 'POST',
+        body: JSON.stringify({ connect }),
+      })
+      setAgentConnected(!!res.connected)
+      if (res.connected) loadAgentStatus()
+      return { ok: !!res.connected, data: res }
+    } catch (e) {
+      setAgentConnected(false)
+      return { ok: false, error: e.message || String(e) }
+    }
+  }, [loadAgentStatus])
+
+  useEffect(() => {
+    let t = null
+    if (agentConnected) {
+      // refrescar estado del agente cada 8s
+      t = setInterval(() => {
+        loadAgentStatus()
+      }, 8000)
+    }
+    return () => { if (t) clearInterval(t) }
+  }, [agentConnected, loadAgentStatus])
+
   const loadPlanHistory = useCallback(() => {
     API('/agent/plan-history').then((d) => setPlanHistory(d.history || [])).catch(() => setPlanHistory([]))
   }, [])
@@ -90,7 +307,12 @@ export default function App() {
   const loadChatHistory = useCallback(() => {
     API('/chat/history').then((d) => {
       if (d.messages && d.messages.length > 0) {
-        setChatHistory(d.messages.map((m) => ({ role: m.role || 'ada', text: m.text || '', brain: m.brain })))
+        setChatHistory(d.messages.map((m) => ({
+          role: m.role || 'ada',
+          text: toMessageString(m.text || m.content),
+          brain: m.brain,
+          imageBase64: m.imageBase64 || null,
+        })))
       }
     }).catch(() => { })
   }, [])
@@ -100,7 +322,7 @@ export default function App() {
     API('/chat/history', {
       method: 'POST',
       body: JSON.stringify({
-        history: history.map((m) => ({ role: m.role, text: m.text || '', brain: m.brain }))
+        history: history.map((m) => ({ role: m.role, text: toMessageString(m.text), brain: m.brain }))
       })
     }).catch(() => { })
   }, [])
@@ -133,13 +355,158 @@ export default function App() {
     return () => clearInterval(t)
   }, [loadFinancials, loadEvents, loadNeedsHelp, loadPlan, activeTab, loadBrainConsole, loadOllamaStatus, loadAgentStatus])
 
+  // Comprobar estado de ADA al montar la app (no conecta automáticamente, solo indica disponibilidad)
+  useEffect(() => {
+    API('/agent/health').then((h) => {
+      try {
+        setAgentConnected(!!(h && h['agent-core']))
+      } catch (e) { setAgentConnected(false) }
+    }).catch(() => setAgentConnected(false))
+  }, [])
+
   useEffect(scrollToBottom, [chatHistory])
 
-  const sendChat = () => {
-    if (!chatMessage.trim()) return
-    const msg = chatMessage.trim()
+  const SILENCE_MS = 1800
+
+  const startVoiceListening = useCallback(() => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
+    if (!SpeechRecognition) {
+      alert('Tu navegador no soporta reconocimiento de voz. Usa Chrome o Edge.')
+      return
+    }
+    if (recognitionRef.current) {
+      if (silenceTimeoutRef.current) {
+        clearTimeout(silenceTimeoutRef.current)
+        silenceTimeoutRef.current = null
+      }
+      try { recognitionRef.current.stop() } catch (e) {}
+      recognitionRef.current = null
+      setVoiceListening(false)
+      setVoiceInterimText('')
+      const text = (chatInputRef.current?.textContent || chatMessage || '').trim()
+      if (text && !loading) {
+        lastSendWasVoiceRef.current = true
+        setChatMessage('')
+        setChatImageBase64(null)
+        if (chatInputRef.current) chatInputRef.current.textContent = ''
+        setPendingVoiceSend(text)
+      }
+      return
+    }
+    const rec = new SpeechRecognition()
+    rec.continuous = true
+    rec.interimResults = true
+    rec.lang = 'es-ES'
+    rec.onresult = (e) => {
+      const last = e.resultIndex
+      const r = e.results[last]
+      const text = Array.from(r).map((x) => x.transcript).join('').trim()
+      if (r.isFinal) {
+        setVoiceInterimText('')
+        if (text) {
+          const el = chatInputRef.current
+          if (el) {
+            const current = (el.textContent || '').trim()
+            const next = current ? current + ' ' + text : text
+            el.textContent = next
+            setChatMessage(next)
+          }
+          if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current)
+          silenceTimeoutRef.current = setTimeout(() => {
+            silenceTimeoutRef.current = null
+            const transcript = (chatInputRef.current && chatInputRef.current.textContent || '').trim()
+            if (!transcript || loading) return
+            try { if (recognitionRef.current) recognitionRef.current.stop() } catch (err) {}
+            lastSendWasVoiceRef.current = true
+            setChatMessage('')
+            setChatImageBase64(null)
+            if (chatInputRef.current) chatInputRef.current.textContent = ''
+            setPendingVoiceSend(transcript)
+            setVoiceListening(false)
+            setVoiceInterimText('')
+          }, SILENCE_MS)
+        }
+      } else {
+        setVoiceInterimText(text)
+      }
+    }
+    rec.onend = () => {
+      if (silenceTimeoutRef.current) {
+        clearTimeout(silenceTimeoutRef.current)
+        silenceTimeoutRef.current = null
+      }
+      if (recognitionRef.current === rec) {
+        recognitionRef.current = null
+        setVoiceListening(false)
+        setVoiceInterimText('')
+      }
+    }
+    rec.onerror = () => {
+      if (silenceTimeoutRef.current) {
+        clearTimeout(silenceTimeoutRef.current)
+        silenceTimeoutRef.current = null
+      }
+      if (recognitionRef.current === rec) {
+        recognitionRef.current = null
+        setVoiceListening(false)
+        setVoiceInterimText('')
+      }
+    }
+    try {
+      rec.start()
+      recognitionRef.current = rec
+      setVoiceListening(true)
+      setVoiceInterimText('')
+    } catch (err) {
+      setVoiceListening(false)
+      setVoiceInterimText('')
+    }
+  }, [chatMessage, loading])
+  useEffect(() => {
+    if (!pendingVoiceSend) return
+    const msg = pendingVoiceSend
+    setPendingVoiceSend('')
+    sendChat(msg)
+  }, [pendingVoiceSend])
+
+  const speakText = useCallback((text, onEnd) => {
+    if (!text || !window.speechSynthesis) return
+    window.speechSynthesis.cancel()
+    const clean = text.replace(/\*\*[^*]*\*\*/g, '').replace(/\n+/g, '. ').trim()
+    if (!clean) return
+    const u = new SpeechSynthesisUtterance(clean)
+    u.lang = 'es-ES'
+    u.rate = 0.95
+    if (typeof onEnd === 'function') {
+      u.onend = () => { onEnd() }
+      u.onerror = () => { onEnd() }
+    }
+    window.speechSynthesis.speak(u)
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      if (silenceTimeoutRef.current) {
+        clearTimeout(silenceTimeoutRef.current)
+        silenceTimeoutRef.current = null
+      }
+      if (recognitionRef.current) {
+        try { recognitionRef.current.stop() } catch (e) {}
+        recognitionRef.current = null
+      }
+    }
+  }, [])
+
+  const sendChat = (overrideMessage) => {
+    const raw = overrideMessage !== undefined && overrideMessage !== null ? overrideMessage : (chatMessage || '')
+    const msg = toMessageString(raw).trim()
+    if (!msg && !chatImageBase64) return
+    const imageToSend = chatImageBase64
     setChatMessage('')
-    setChatHistory(h => [...h, { role: 'user', text: msg }])
+    setChatImageBase64(null)
+    if (chatInputRef.current) chatInputRef.current.textContent = ''
+    const userText = msg || '(imagen adjunta)'
+    setChatHistory(h => [...h, { role: 'user', text: userText, imageBase64: imageToSend || null }])
     setLoading(true)
 
     if (chatTimeoutRef.current) clearTimeout(chatTimeoutRef.current)
@@ -149,7 +516,7 @@ export default function App() {
 
     const history = chatHistory.slice(-10).map((m) => ({
       role: m.role === 'ada' ? 'assistant' : 'user',
-      content: m.text || '',
+      content: toMessageString(m.text),
     }))
 
     const clearLoading = () => {
@@ -169,28 +536,45 @@ export default function App() {
       }
       setChatHistory(h => {
         const last = h[h.length - 1]
-        const userText = last?.role === 'user' ? (last.text || '') : ''
-        if (userText) setTimeout(() => setChatMessage(userText), 0)
+        const userText = toMessageString(last?.role === 'user' ? last.text : '')
+        if (userText) { setTimeout(() => { setChatMessage(userText); if (chatInputRef.current) chatInputRef.current.textContent = userText }, 0) }
         return [...h.slice(0, -1), { role: 'ada', text: 'Tiempo de espera agotado. Edita tu mensaje abajo y vuelve a intentar, o revisa que Ollama y agent-core estén activos.' }]
       })
       setLoading(false)
     }, 200000)
 
+    const body = { message: msg || '¿Qué ves en esta imagen?', use_ollama: true, history }
+    if (imageToSend) body.image_base64 = imageToSend
     API('/chat', {
       method: 'POST',
-      body: JSON.stringify({ message: msg, use_ollama: true, history }),
+      body: JSON.stringify(body),
       signal: controller.signal,
     })
       .then((res) => {
         clearLoading()
-        const newAda = res.response ? { role: 'ada', text: res.response, brain: res.brain } : null
+        const responseText = toMessageString(res.response)
+        const newAda = responseText ? { role: 'ada', text: responseText, brain: res.brain } : null
         setChatHistory(h => {
           const next = newAda ? [...h, newAda] : h
           return next
         })
+        if (speakResponseRef.current || lastSendWasVoiceRef.current) {
+          const wasVoice = lastSendWasVoiceRef.current
+          lastSendWasVoiceRef.current = false
+          if (responseText) {
+            speakText(responseText, () => {
+              if (wasVoice && voiceConversationModeRef.current && !loading) startVoiceListening()
+            })
+          }
+        }
         const prop = res.proposal || (res.full && res.full.proposal)
         if (res.status === 'pending_approval' || res.task_result?.status === 'pending_approval') {
           setPendingProposal(prop)
+        }
+        if (res.status === 'pending_plan' && Array.isArray(res.pending_plan) && res.pending_plan.length > 0) {
+          setPendingPlan(res.pending_plan)
+        } else {
+          setPendingPlan(null)
         }
         loadNeedsHelp()
         loadPlan()
@@ -200,8 +584,8 @@ export default function App() {
         if (e.name === 'AbortError') {
           setChatHistory(h => {
             const last = h[h.length - 1]
-            const userText = last?.role === 'user' ? (last.text || '') : ''
-            if (userText) setTimeout(() => setChatMessage(userText), 0)
+            const userText = toMessageString(last?.role === 'user' ? last.text : '')
+            if (userText) { setTimeout(() => { setChatMessage(userText); if (chatInputRef.current) chatInputRef.current.textContent = userText }, 0) }
             return [...h.slice(0, -1), { role: 'ada', text: 'Respuesta detenida. Edita tu mensaje abajo y vuelve a enviar si algo quedó mal.' }]
           })
         } else {
@@ -226,8 +610,8 @@ export default function App() {
     }
     setChatHistory(h => {
       const last = h[h.length - 1]
-      const userText = last?.role === 'user' ? (last.text || '') : ''
-      if (userText) setTimeout(() => setChatMessage(userText), 0)
+      const userText = toMessageString(last?.role === 'user' ? last.text : '')
+      if (userText) { setTimeout(() => { setChatMessage(userText); if (chatInputRef.current) chatInputRef.current.textContent = userText }, 0) }
       return h.length > 1 && last?.role === 'user' ? [...h.slice(0, -1), { role: 'ada', text: 'Respuesta detenida. Edita tu mensaje abajo y vuelve a enviar si algo quedó mal.' }] : h
     })
     setLoading(false)
@@ -241,6 +625,32 @@ export default function App() {
         setPendingProposal(null)
         loadEvents()
       })
+      .finally(() => setLoading(false))
+  }
+
+  const handleResetAll = (clearChat = true) => {
+    if (!window.confirm('¿Limpiar todo? Se borrarán plan, oferta, aprendizajes y' + (clearChat ? ' el historial del chat. ADA empezará de cero.' : ' (el chat se mantiene).'))) return
+    setLoading(true)
+    // Vaciar el panel derecho de inmediato para que no siga viendo el plan anterior
+    setPlan(null)
+    setNeedsHelp({ steps: [], platforms: [] })
+    fetch(`/api/autonomous/reset_all?clear_chat=${clearChat}`, { method: 'POST', headers: { 'Content-Type': 'application/json' } })
+      .then((r) => r.ok ? r.json() : Promise.reject(new Error(r.statusText)))
+      .then((data) => {
+        if (clearChat) {
+          setChatHistory([{ role: 'ada', text: 'Hola, soy A.D.A. He reiniciado todo. ¿Sobre qué quieres que hablemos o qué plan quieres que proponga?' }])
+          saveChatHistory([{ role: 'ada', text: 'Hola, soy A.D.A. He reiniciado todo. ¿Sobre qué quieres que hablemos o qué plan quieres que proponga?' }])
+        }
+        // Refrescar datos del backend tras un breve retraso para que el reset se haya persistido
+        setTimeout(() => {
+          loadPlan()
+          loadNeedsHelp()
+          loadEvents()
+          loadAgentStatus()
+        }, 500)
+        alert(data.message || 'Todo limpiado.')
+      })
+      .catch((e) => alert('Error: ' + e.message))
       .finally(() => setLoading(false))
   }
 
@@ -261,7 +671,38 @@ export default function App() {
 
   return (
     <div className="app-layout">
-      {/* LEFT PANE: CHAT & DECISIONS */}
+      {/* COLUMNA IZQUIERDA: EXPLORADOR DE ARCHIVOS */}
+      <section className="pane pane-files" aria-label="Explorador de archivos">
+        <header className="pane-header pane-header-files">
+          <h2 className="file-explorer-title">Archivos</h2>
+          <button
+            type="button"
+            className="secondary"
+            style={{ padding: '0.35rem 0.6rem', fontSize: '0.8rem' }}
+            onClick={() => {
+              setFileExplorerCache({})
+              setFileExplorerExpanded(new Set())
+              setSelectedFilePath(null)
+              fileExplorerFetch('')
+            }}
+            title="Actualizar raíz"
+          >
+            Actualizar
+          </button>
+        </header>
+        <div className="file-explorer-content">
+          <FileExplorer
+            expanded={fileExplorerExpanded}
+            onToggle={fileExplorerToggle}
+            cache={fileExplorerCache}
+            loadingPath={fileExplorerLoadingPath}
+            onSelect={setSelectedFilePath}
+            selectedPath={selectedFilePath}
+            onFetch={fileExplorerFetch}
+          />
+        </div>
+      </section>
+      {/* CENTRO: CHAT & DECISIONS */}
       <section className="pane pane-left">
         <header className="pane-header">
           <h2><span className="badge badge-success">ADA</span> Tu socio</h2>
@@ -274,45 +715,87 @@ export default function App() {
             >
               {theme === 'dark' ? 'Modo claro' : 'Modo oscuro'}
             </button>
+            <button
+              type="button"
+              onClick={async () => {
+                const res = await connectAgent(!agentConnected)
+                if (res && res.ok) {
+                  // toggled state handled inside connectAgent
+                } else {
+                  alert('No se pudo conectar: ' + (res && res.error ? res.error : 'error'))
+                }
+              }}
+              title="Conectar o desconectar ADA"
+              style={{ padding: '0.4rem 0.6rem' }}
+            >
+              {agentConnected ? 'Desconectar ADA' : 'Conectar ADA'}
+            </button>
+            <div style={{ width: 10, height: 10, borderRadius: 10, background: agentConnected ? 'var(--success)' : 'var(--muted)', boxShadow: agentConnected ? '0 0 6px rgba(0,200,120,0.2)' : 'none' }} aria-hidden="true" />
           </div>
           <div style={{ fontSize: '0.8rem', opacity: 0.6 }}>Opina, propone planes y explica el porqué de sus decisiones</div>
         </header>
 
         <div className="chat-container">
           <div className="chat-history">
-            {chatHistory.map((m, i) => (
+            {chatHistory.map((m, i) => {
+              const msgText = toMessageString(m.text)
+              return (
               <div key={i} className={`message message-${m.role} animate-fade-in`}>
                 <div className="avatar">{m.role === 'ada' ? 'A' : 'T'}</div>
                 <div className="message-bubble">
+                  {m.role === 'user' && m.imageBase64 && (
+                    <div style={{ marginBottom: '0.5rem' }}>
+                      <img
+                        src={m.imageBase64.startsWith('data:') ? m.imageBase64 : `data:image/jpeg;base64,${m.imageBase64}`}
+                        alt="Imagen enviada"
+                        style={{ maxWidth: '100%', maxHeight: 200, borderRadius: 8, display: 'block' }}
+                      />
+                    </div>
+                  )}
                   {m.brain === 'advanced' && (
                     <div className="brain-indicator advanced">
                       <span className="brain-icon">🧠</span> DeepSeek-R1
                     </div>
                   )}
-                  {m.role === 'ada' && m.text.includes('**Necesito tu ayuda:**') ? (() => {
-                    const parts = m.text.split('**Necesito tu ayuda:**')
-                    const after = parts[1] ? parts[1].trim() : ''
-                    return (
-                      <>
-                        {parts[0].split('\n').map((line, li) => (
-                          <div key={li} style={{ marginBottom: line ? '0.2rem' : '0.8rem' }}>{line}</div>
-                        ))}
-                        {after && (
-                          <div className="needs-help-box" style={{ marginTop: '0.75rem', padding: '0.75rem', background: 'rgba(255,180,0,0.15)', borderLeft: '4px solid var(--warn)', borderRadius: 4 }}>
-                            <strong>Necesito tu ayuda:</strong>
-                            <div style={{ marginTop: 0.25 }}>{after.split('\n').map((l, li) => <div key={li}>{l}</div>)}</div>
-                          </div>
-                        )}
-                      </>
-                    )
+                  {m.role === 'ada' ? (() => {
+                    const segments = parseMessageWithCodeBlocks(msgText)
+                    return segments.map((seg, si) => {
+                      if (seg.type === 'code') {
+                        return <ChatCodeBlock key={si} content={seg.content} language={seg.language} />
+                      }
+                      const text = seg.content
+                      if (text.includes('**Necesito tu ayuda:**')) {
+                        const parts = text.split('**Necesito tu ayuda:**')
+                        const after = parts[1] ? parts[1].trim() : ''
+                        return (
+                          <React.Fragment key={si}>
+                            {parts[0].split('\n').map((line, li) => (
+                              <div key={li} style={{ marginBottom: line ? '0.2rem' : '0.8rem' }}>{line}</div>
+                            ))}
+                            {after && (
+                              <div className="needs-help-box" style={{ marginTop: '0.75rem', padding: '0.75rem', background: 'rgba(255,180,0,0.15)', borderLeft: '4px solid var(--warn)', borderRadius: 4 }}>
+                                <strong>Necesito tu ayuda:</strong>
+                                <div style={{ marginTop: 0.25 }}>{after.split('\n').map((l, li) => <div key={li}>{l}</div>)}</div>
+                              </div>
+                            )}
+                          </React.Fragment>
+                        )
+                      }
+                      return text.split('\n').map((line, li) => (
+                        <div key={`${si}-${li}`} style={{ marginBottom: line ? '0.2rem' : '0.8rem' }}>{line}</div>
+                      ))
+                    })
                   })() : (
-                    m.text.split('\n').map((line, li) => (
-                      <div key={li} style={{ marginBottom: line ? '0.2rem' : '0.8rem' }}>{line}</div>
-                    ))
+                    parseMessageWithCodeBlocks(msgText).map((seg, si) => {
+                      if (seg.type === 'code') return <ChatCodeBlock key={si} content={seg.content} language={seg.language} />
+                      return seg.content.split('\n').map((line, li) => (
+                        <div key={`${si}-${li}`} style={{ marginBottom: line ? '0.2rem' : '0.8rem' }}>{line}</div>
+                      ))
+                    })
                   )}
                 </div>
               </div>
-            ))}
+            )})}
             {loading && (
               <div className="message message-ada animate-fade-in">
                 <div className="avatar">A</div>
@@ -369,6 +852,36 @@ export default function App() {
                 )}
               </div>
             )}
+            {pendingPlan && pendingPlan.length > 0 && (
+              <div className="glass-card animate-fade-in" style={{ marginBottom: '1rem', borderLeft: '4px solid var(--accent)' }}>
+                <div style={{ fontSize: '0.8rem', fontWeight: 'bold', marginBottom: '0.5rem', color: 'var(--accent)' }}>
+                  PLAN PENDIENTE DE EJECUCIÓN
+                </div>
+                <p style={{ fontSize: '0.85rem', marginBottom: '0.75rem' }}>ADA ha propuesto {pendingPlan.length} acción(es). Revisa el mensaje de arriba y ejecuta cuando quieras.</p>
+                <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setLoading(true)
+                      API('/execute_plan', { method: 'POST', body: JSON.stringify({ plan: pendingPlan }) })
+                        .then((data) => {
+                          const results = (data.results || []).join('\n')
+                          setChatHistory(h => [...h, { role: 'ada', text: '**Resultado de ejecutar el plan:**\n\n' + (results || '(sin salida)') }])
+                          setPendingPlan(null)
+                        })
+                        .catch((e) => {
+                          setChatHistory(h => [...h, { role: 'ada', text: 'Error al ejecutar el plan: ' + e.message }])
+                          setPendingPlan(null)
+                        })
+                        .finally(() => setLoading(false))
+                    }}
+                  >
+                    Ejecutar plan
+                  </button>
+                  <button type="button" className="secondary" onClick={() => setPendingPlan(null)}>Descartar plan</button>
+                </div>
+              </div>
+            )}
             {pendingProposal && (
               <div className="glass-card animate-fade-in" style={{ marginBottom: '1rem', borderLeft: '4px solid var(--warn)' }}>
                 <div style={{ fontSize: '0.8rem', fontWeight: 'bold', marginBottom: '0.5rem', color: 'var(--warn)' }}>
@@ -381,16 +894,232 @@ export default function App() {
                 </div>
               </div>
             )}
+            {/* Herramientas ADA v2/v3: objetivos, investigación, auto-mejora, oportunidades, planes, aprendizaje */}
+            <div className="ada-tools-section" style={{ marginBottom: '0.75rem' }}>
+              <button
+                type="button"
+                className="secondary"
+                style={{ fontSize: '0.8rem', marginBottom: adaToolsOpen ? '0.5rem' : 0 }}
+                onClick={() => setAdaToolsOpen((o) => !o)}
+                title="Ver herramientas de las APIs v2/v3 (objetivos, investigación, planes, etc.)"
+              >
+                {adaToolsOpen ? '▼ Ocultar herramientas ADA' : '▶ Herramientas ADA (v2/v3)'}
+              </button>
+              {adaToolsOpen && (
+                <>
+                  <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', margin: '0 0 0.5rem 0' }}>
+                    Objetivos, investigación, planes y aprendizaje que ADA genera en segundo plano (APIs v2/v3).
+                  </p>
+                <div className="ada-tools-buttons" style={{ display: 'flex', flexWrap: 'wrap', gap: '0.4rem', marginBottom: '0.5rem' }}>
+                  <button type="button" className="secondary" style={{ fontSize: '0.75rem' }} title="Lista de objetivos que ADA está trabajando en segundo plano"
+                    onClick={async () => {
+                      setAdaToolsLoading(true); setAdaToolsResult(null)
+                      try {
+                        const d = await API('/ada/v2/goals')
+                        setAdaToolsResult({ title: 'Objetivos (v2)', data: d })
+                      } catch (e) { setAdaToolsResult({ title: 'Error', data: e.message }) }
+                      finally { setAdaToolsLoading(false) }
+                    }}>Objetivos</button>
+                  <button type="button" className="secondary" style={{ fontSize: '0.75rem' }} title="Añadir un objetivo para que ADA lo investigue y genere ideas"
+                    onClick={async () => {
+                      const goal = window.prompt('Objetivo nuevo (ej: aumentar ingresos con un producto digital):')
+                      if (!goal?.trim()) return
+                      setAdaToolsLoading(true); setAdaToolsResult(null)
+                      try {
+                        const d = await API('/ada/v2/goals', { method: 'POST', body: JSON.stringify({ goal: goal.trim() }) })
+                        setAdaToolsResult({ title: 'Objetivo añadido', data: d })
+                      } catch (e) { setAdaToolsResult({ title: 'Error', data: e.message }) }
+                      finally { setAdaToolsLoading(false) }
+                    }}>Añadir objetivo</button>
+                  <button type="button" className="secondary" style={{ fontSize: '0.75rem' }} title="Investigar un tema: ADA analiza y propone estrategias"
+                    onClick={async () => {
+                      const goal = window.prompt('¿Qué quieres investigar? (ej: cómo monetizar un blog):')
+                      if (!goal?.trim()) return
+                      setAdaToolsLoading(true); setAdaToolsResult(null)
+                      try {
+                        const d = await API('/ada/v3/research', { method: 'POST', body: JSON.stringify({ goal: goal.trim(), context: '' }) })
+                        setAdaToolsResult({ title: 'Investigación (v3)', data: typeof d.analysis === 'string' ? d.analysis : d })
+                      } catch (e) { setAdaToolsResult({ title: 'Error', data: e.message }) }
+                      finally { setAdaToolsLoading(false) }
+                    }}>Investigar</button>
+                  <button type="button" className="secondary" style={{ fontSize: '0.75rem' }} title="Análisis de cuellos de botella y sugerencias de mejora del sistema"
+                    onClick={async () => {
+                      setAdaToolsLoading(true); setAdaToolsResult(null)
+                      try {
+                        const d = await API('/ada/v2/self-improvement')
+                        setAdaToolsResult({ title: 'Auto-mejora (v2)', data: typeof d.analysis === 'string' ? d.analysis : d })
+                      } catch (e) { setAdaToolsResult({ title: 'Error', data: e.message }) }
+                      finally { setAdaToolsLoading(false) }
+                    }}>Auto-mejora</button>
+                  <button type="button" className="secondary" style={{ fontSize: '0.75rem' }} title="Oportunidades mejor puntuadas por ADA"
+                    onClick={async () => {
+                      setAdaToolsLoading(true); setAdaToolsResult(null)
+                      try {
+                        const d = await API('/ada/v3/opportunities/top')
+                        setAdaToolsResult({ title: 'Oportunidades (v3)', data: d })
+                      } catch (e) { setAdaToolsResult({ title: 'Error', data: e.message }) }
+                      finally { setAdaToolsLoading(false) }
+                    }}>Oportunidades</button>
+                  <button type="button" className="secondary" style={{ fontSize: '0.75rem' }} title="Planes de acción generados por el scheduler"
+                    onClick={async () => {
+                      setAdaToolsLoading(true); setAdaToolsResult(null)
+                      try {
+                        const d = await API('/ada/v3/plans')
+                        setAdaToolsResult({ title: 'Planes (v3)', data: d })
+                      } catch (e) { setAdaToolsResult({ title: 'Error', data: e.message }) }
+                      finally { setAdaToolsLoading(false) }
+                    }}>Planes</button>
+                  <button type="button" className="secondary" style={{ fontSize: '0.75rem' }} title="Aprendizajes recientes (experiencias evaluadas)"
+                    onClick={async () => {
+                      setAdaToolsLoading(true); setAdaToolsResult(null)
+                      try {
+                        const d = await API('/ada/v3/learning')
+                        setAdaToolsResult({ title: 'Aprendizaje (v3)', data: d })
+                      } catch (e) { setAdaToolsResult({ title: 'Error', data: e.message }) }
+                      finally { setAdaToolsLoading(false) }
+                    }}>Aprendizaje</button>
+                </div>
+                </>
+              )}
+              {adaToolsLoading && <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: '0.35rem' }}>Cargando…</div>}
+              {adaToolsResult && !adaToolsLoading && (
+                <div className="ada-tools-result glass-card" style={{ padding: '0.6rem 0.75rem', fontSize: '0.8rem', maxHeight: 220, overflow: 'auto', borderLeft: '4px solid var(--accent)', marginTop: '0.35rem' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.4rem' }}>
+                    <strong>{adaToolsResult.title}</strong>
+                    <button type="button" className="secondary" style={{ padding: '0.2rem 0.4rem', fontSize: '0.7rem' }} onClick={() => setAdaToolsResult(null)}>Cerrar</button>
+                  </div>
+                  <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: 'var(--font-mono)', fontSize: '0.75rem' }}>
+                    {typeof adaToolsResult.data === 'string' ? adaToolsResult.data : JSON.stringify(adaToolsResult.data, null, 2)}
+                  </pre>
+                </div>
+              )}
+            </div>
+            {chatImageBase64 && (
+              <div style={{ marginBottom: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <img src={chatImageBase64.startsWith('data:') ? chatImageBase64 : `data:image/jpeg;base64,${chatImageBase64}`} alt="Adjunta" style={{ maxHeight: 48, borderRadius: 4 }} />
+                <button type="button" className="secondary" style={{ fontSize: '0.75rem' }} onClick={() => setChatImageBase64(null)}>Quitar imagen</button>
+              </div>
+            )}
+            {voiceListening && (
+              <div className="voice-listening-bar">
+                <span className="voice-listening-dot" />
+                <span className="voice-listening-text">Te escucho. Habla y al terminar responderé con voz (no hace falta Enviar).</span>
+                {voiceInterimText && <span className="voice-interim">"{voiceInterimText}"</span>}
+              </div>
+            )}
+            <div className="chat-image-toolbar">
+              <span className="chat-image-toolbar-label">Voz:</span>
+              <button
+                type="button"
+                className={`chat-image-btn chat-voice-btn ${voiceListening ? 'active' : ''}`}
+                title={voiceListening ? 'Detener y enviar ya' : 'Conversación por voz con ADA'}
+                onClick={startVoiceListening}
+                style={voiceListening ? { background: 'rgba(255,80,80,0.25)', borderColor: 'var(--warn)' } : {}}
+              >
+                {voiceListening ? '⏹ Detener' : '🎤 Hablar con ADA'}
+              </button>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', cursor: 'pointer', fontSize: '0.8rem', color: 'var(--subtle)' }}>
+                <input type="checkbox" checked={voiceConversationMode} onChange={(e) => setVoiceConversationMode(e.target.checked)} />
+                Conversación continua
+              </label>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', cursor: 'pointer', fontSize: '0.8rem', color: 'var(--subtle)' }}>
+                <input type="checkbox" checked={speakResponse} onChange={(e) => setSpeakResponse(e.target.checked)} />
+                Leer respuesta (texto)
+              </label>
+              <span className="chat-image-toolbar-label">Imagen:</span>
+              <label className="chat-image-btn">
+                <input type="file" accept="image/*" style={{ display: 'none' }} onChange={(e) => { const f = e.target.files?.[0]; if (f) { const r = new FileReader(); r.onload = () => setChatImageBase64(r.result); r.readAsDataURL(f) } e.target.value = '' }} />
+                📷 Elegir archivo
+              </label>
+              <button
+                type="button"
+                className="chat-image-btn"
+                title="Pegar imagen desde el portapapeles (Ctrl+V en el cuadro también)"
+                onClick={async () => {
+                  try {
+                    const items = await navigator.clipboard?.read?.()
+                    if (!items) return
+                    for (const item of items) {
+                      const imageType = item.types.find(t => t.startsWith('image/'))
+                      if (imageType) {
+                        const blob = await item.getType(imageType)
+                        const r = new FileReader()
+                        r.onload = () => setChatImageBase64(r.result)
+                        r.readAsDataURL(blob)
+                        return
+                      }
+                    }
+                  } catch (_) {}
+                }}
+              >
+                📋 Pegar imagen
+              </button>
+            </div>
             <div className="chat-input-row">
-              <input
-                type="text"
-                placeholder="Hablar con tu socio: metas, opiniones, por qué ese plan..."
-                value={chatMessage}
-                onChange={(e) => setChatMessage(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && !loading && sendChat()}
-                disabled={loading}
+              <div
+                ref={chatInputRef}
+                className="chat-input-editable"
+                contentEditable={!loading}
+                suppressContentEditableWarning
+                role="textbox"
+                aria-placeholder="Hablar con tu socio: metas, opiniones, por qué ese plan... (o pega/adjunta una imagen)"
+                data-placeholder="Hablar con tu socio: metas, opiniones, por qué ese plan... (o pega/adjunta una imagen)"
+                onInput={() => setChatMessage(chatInputRef.current?.textContent?.replace(/\n/g, ' ') ?? '')}
+                onPaste={(e) => {
+                  const dt = e.clipboardData
+                  // Leer texto ya: clipboardData solo está disponible de forma síncrona durante el evento
+                  const textPlain = dt ? (dt.getData('text/plain') || '') : ''
+                  let file = null
+                  if (dt) {
+                    if (dt.files?.length && dt.files[0].type.startsWith('image/')) file = dt.files[0]
+                    if (!file && dt.items) {
+                      for (let i = 0; i < dt.items.length; i++) {
+                        if (dt.items[i].type.indexOf('image') !== -1) {
+                          file = dt.items[i].getAsFile()
+                          break
+                        }
+                      }
+                    }
+                  }
+                  if (file) {
+                    e.preventDefault()
+                    const r = new FileReader()
+                    r.onload = () => setChatImageBase64(r.result)
+                    r.readAsDataURL(file)
+                    return
+                  }
+                  // Pegado de texto: insertar nosotros para controlar formato (ya tenemos textPlain leído en sync)
+                  if (textPlain) {
+                    e.preventDefault()
+                    document.execCommand('insertText', false, textPlain)
+                    setChatMessage(chatInputRef.current?.textContent?.replace(/\n/g, ' ') ?? '')
+                    return
+                  }
+                  // Si no había imagen ni texto en el evento, intentar API async solo para imagen (opcional)
+                  if (typeof navigator.clipboard?.read === 'function') {
+                    e.preventDefault()
+                    navigator.clipboard.read().then((items) => {
+                      for (const item of items) {
+                        const imageType = item.types.find(t => t.startsWith('image/'))
+                        if (imageType) {
+                          return item.getType(imageType).then((blob) => {
+                            const r = new FileReader()
+                            r.onload = () => setChatImageBase64(r.result)
+                            r.readAsDataURL(blob)
+                          })
+                        }
+                      }
+                    }).catch(() => {})
+                  }
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault()
+                    if (!loading) sendChat()
+                  }
+                }}
               />
-              <button onClick={sendChat} disabled={loading || !chatMessage.trim()}>
+              <button onClick={sendChat} disabled={loading || (!chatMessage.trim() && !chatImageBase64)}>
                 Enviar
               </button>
             </div>
@@ -408,6 +1137,7 @@ export default function App() {
             <button className={`tab-btn ${activeTab === 'logs' ? 'active' : ''}`} onClick={() => setActiveTab('logs')}>Consola</button>
             <button className={`tab-btn ${activeTab === 'brain' ? 'active' : ''}`} onClick={() => { setActiveTab('brain'); loadBrainConsole(); loadOllamaStatus(); }}>ConsolaCerebro</button>
             <button className={`tab-btn ${activeTab === 'finance' ? 'active' : ''}`} onClick={() => setActiveTab('finance')}>Finanzas</button>
+            <button type="button" className="danger" style={{ marginLeft: 'auto', fontSize: '0.75rem', padding: '0.35rem 0.6rem' }} onClick={() => handleResetAll(true)} title="Borrar plan, oferta, aprendizajes y chat. ADA empieza de cero.">Limpiar todo</button>
           </nav>
           <div className="pane-header-meta">
             <div style={{ textAlign: 'right' }}>
@@ -669,32 +1399,7 @@ export default function App() {
               <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
                 <button type="button" className="secondary" style={{ fontSize: '0.8rem' }} onClick={loadSelfCheck}>Que ADA revise su funcionamiento y herramientas</button>
                 <button type="button" className="secondary" style={{ fontSize: '0.8rem' }} onClick={handleClearPlan}>Solo plan</button>
-              <button
-                type="button"
-                className="danger"
-                style={{ fontSize: '0.8rem' }}
-                onClick={() => {
-                  if (!window.confirm('¿Limpiar TODO (plan, oferta, pasos)? Opcional: también borrar historial de chat. ¿Incluir chat?')) return
-                  const clearChat = window.confirm('¿Borrar también el historial del chat? (Cancelar = no borrar chat)')
-                  setLoading(true)
-                  fetch(`/api/autonomous/reset_all?clear_chat=${clearChat}`, { method: 'POST', headers: { 'Content-Type': 'application/json' } })
-                    .then((r) => r.ok ? r.json() : Promise.reject(new Error(r.statusText)))
-                    .then((data) => {
-                      setPlan(null)
-                      setNeedsHelp({ steps: [], platforms: [] })
-                      loadPlan(); loadNeedsHelp(); loadEvents(); loadAgentStatus()
-                      if (clearChat) {
-                        setChatHistory([{ role: 'ada', text: 'Hola, soy A.D.A. He reiniciado todo. ¿Sobre qué quieres que hablemos o qué plan quieres que proponga?' }])
-                        saveChatHistory([{ role: 'ada', text: 'Hola, soy A.D.A. He reiniciado todo. ¿Sobre qué quieres que hablemos o qué plan quieres que proponga?' }])
-                      }
-                      alert(data.message || 'Todo limpiado. Puedes iniciar de nuevo.')
-                    })
-                    .catch((e) => alert('Error: ' + e.message))
-                    .finally(() => setLoading(false))
-                }}
-              >
-                Limpiar todo e iniciar de nuevo
-              </button>
+              <button type="button" className="danger" style={{ fontSize: '0.8rem' }} onClick={() => handleResetAll(true)}>Limpiar todo e iniciar de nuevo</button>
               </div>
               {selfCheck && (
                 <div style={{ padding: '1rem', background: 'rgba(0,0,0,0.2)', borderRadius: 8, borderLeft: `4px solid ${selfCheck.sufficient ? 'var(--accent)' : 'var(--warn)'}`, whiteSpace: 'pre-wrap', fontSize: '0.9rem' }}>{selfCheck.message}</div>

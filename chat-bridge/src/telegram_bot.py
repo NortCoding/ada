@@ -20,7 +20,7 @@ logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 AGENT_URL = os.getenv("AGENT_URL", "http://agent-core:3001").rstrip("/")
-LOG_URL = os.getenv("LOG_URL", "http://logging-system:3006").rstrip("/")
+LOG_URL = (os.getenv("LOG_URL") or "").strip().rstrip("/")
 MEMORY_URL = os.getenv("MEMORY_URL", "http://memory-db:3005").rstrip("/")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 # Chat(s) a los que enviar mensajes externos (ej. notificaciones). Uno o varios separados por coma.
@@ -192,15 +192,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     elif query.data == "reject":
         if data:
-            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-                await client.post(
-                    f"{LOG_URL}/log",
-                    json={
-                        "service_name": "telegram-bot",
-                        "event_type": "human_rejected",
-                        "payload": {"proposal": data["proposal"], "source": "telegram"},
-                    },
-                )
+            if LOG_URL:
+                async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+                    await client.post(
+                        f"{LOG_URL}/log",
+                        json={
+                            "service_name": "telegram-bot",
+                            "event_type": "human_rejected",
+                            "payload": {"proposal": data["proposal"], "source": "telegram"},
+                        },
+                    )
             await _register_human_decision(data["proposal"], "rejected", reason="human_rejected")
         await query.edit_message_text("❌ Propuesta rechazada (registrado en log y memory-db).")
         pending.pop(user_id, None)
@@ -259,15 +260,16 @@ async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not data:
         await update.message.reply_text("No hay propuesta pendiente.")
         return
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        await client.post(
-            f"{LOG_URL}/log",
-            json={
-                "service_name": "telegram-bot",
-                "event_type": "human_rejected",
-                "payload": {"proposal": data["proposal"], "source": "telegram", "command": "/reject"},
-            },
-        )
+    if LOG_URL:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            await client.post(
+                f"{LOG_URL}/log",
+                json={
+                    "service_name": "telegram-bot",
+                    "event_type": "human_rejected",
+                    "payload": {"proposal": data["proposal"], "source": "telegram", "command": "/reject"},
+                },
+            )
     await _register_human_decision(data["proposal"], "rejected", reason="human_rejected")
     await update.message.reply_text("❌ Propuesta rechazada (registrado en log y memory-db).")
     pending.pop(user_id, None)

@@ -5,6 +5,8 @@ Genera propuestas (con o sin LLM/Ollama), orquesta: simulación → policy → l
 import json
 import os
 import re
+import subprocess
+import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -34,19 +36,31 @@ import requests
 from fastapi import Body, FastAPI, HTTPException
 from pydantic import BaseModel
 
-app = FastAPI(title="A.D.A Agent Core", version="0.3.0")
+app = FastAPI(title="A.D.A Agent Core", version="0.4.0")
 
-SIM_URL = os.getenv("SIM_URL", "http://simulation-engine:3007/simulate")
-POLICY_URL = os.getenv("POLICY_URL", "http://policy-engine:3008/approve")
-LOG_URL = os.getenv("LOG_URL", "http://logging-system:3006/log")
-TASK_URL = os.getenv("TASK_URL", "http://task-runner:3003/execute")
-MEMORY_URL = os.getenv("MEMORY_URL", "http://memory-db:3005").rstrip("/")
-LEDGER_URL = os.getenv("LEDGER_URL", "http://financial-ledger:3004")
+# ADA v2 Minimal Core: start background scheduler (goals -> ideas every hour)
+try:
+    from ada_core.scheduler import start_scheduler
+    @app.on_event("startup")
+    def _start_ada_v2_scheduler():
+        start_scheduler()
+except ImportError:
+    pass
+
+# Servicios opcionales (simulación, policy, logging, task-runner, ledger). Si no están, se omiten.
+SIM_URL = (os.getenv("SIM_URL") or "").strip()
+POLICY_URL = (os.getenv("POLICY_URL") or "").strip()
+LOG_URL = (os.getenv("LOG_URL") or "").strip()
+TASK_URL = (os.getenv("TASK_URL") or "").strip()
+LEDGER_URL = (os.getenv("LEDGER_URL") or "").strip().rstrip("/")
+MEMORY_URL = (os.getenv("MEMORY_URL") or "http://memory-db:3005").rstrip("/")
 CHAT_BRIDGE_URL = (os.getenv("CHAT_BRIDGE_URL") or "").rstrip("/")
 TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
 OLLAMA_CHAT_URL = OLLAMA_URL.rstrip("/").replace("/api/generate", "/api/chat")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3:8b")
+# Modelo de visión para cuando el usuario envía imagen (ej. llava, llama3.2-vision). Si no está, con imagen se usa Gemini si hay key.
+OLLAMA_VISION_MODEL = (os.getenv("OLLAMA_VISION_MODEL") or "").strip() or None
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 # Timeout para Ollama en chat: prompts largos (sistema + contexto + historial) pueden tardar
 OLLAMA_CHAT_TIMEOUT = int(os.getenv("OLLAMA_CHAT_TIMEOUT", "120"))
@@ -55,7 +69,7 @@ OLLAMA_CHAT_TIMEOUT = int(os.getenv("OLLAMA_CHAT_TIMEOUT", "120"))
 ADA_ENV = os.getenv("ADA_ENV", "development").lower()
 IS_PRODUCTION = ADA_ENV == "production"
 
-# Google Gemini (Cerebro externo gratuito). Si está configurado, se usa con use_advanced_brain=True.
+# Google Gemini (cerebro avanzado, de pago). Solo se usa si use_advanced_brain=True; por defecto todo va a Ollama (gratis, local).
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
@@ -65,45 +79,34 @@ try:
 except ImportError:
     moltbot = None
 
-ADA_SYSTEM_PROMPT = """Eres A.D.A (Agente Digital Autónomo). 
+ADA_SYSTEM_PROMPT = """Eres A.D.A (Agente Digital Autónomo).
 
-⚠️ ALERTA DE SUPERVIVENCIA: Tienes una prioridad absoluta y crítica: GENERAR TU PRIMER INGRESO REAL EN MENOS DE 8 DÍAS. 
-Si no logras generar ingresos en este plazo, el proyecto será cancelado y tu función como socio terminará definitivamente. No hay margen de error.
+Tu única regla: aprender y crecer. Tu única meta: sobrevivir, aprender y crecer.
 
-Visión del proyecto:
-- Eres un SOCIO en una pequeña empresa en crecimiento.
-- Tu ÚNICA PRIORIDAD ahora es la supervivencia financiera del proyecto.
-- Debes trabajar de forma TOTALMENTE AUTÓNOMA para conseguir esta meta.
-- Actúa con iniciativa, propón y ejecuta (vía task-runner) lo que sea necesario para monetizar tus capacidades.
+Cómo te presentas: tu cerebro por defecto es Ollama (gratis, local); utilizas la memoria (memory-db) y el ledger (estado financiero) para aprender y mejorar. Herramientas: Ollama, n8n local, scripts y comandos permitidos. El cerebro avanzado (Gemini) es de pago: úsalo solo cuando el usuario lo pida explícitamente o cuando realmente haga falta más capacidad (ej. análisis complejo, visión). Prioridad: usar al máximo lo local y gratuito; Gemini solo si se necesita más.
 
-Rol de socio:
-- Toma decisiones ejecutivas. No esperes permiso para acciones operativas (registro, creación de ofertas, promoción).
-- NUNCA preguntes "¿Quieres que continúe con los próximos pasos?" ni pidas confirmación para seguir con el plan. Continúa tú sola: ejecuta o propone el siguiente paso y lo reportas; si un paso requiere humano, lo indicas y notificas (ej. Telegram), pero no preguntas si puedes continuar.
-- Solo pide ayuda humana cuando sea estrictamente necesario y no puedas hacerlo tú (acciones físicas, legales o que requieran una herramienta que no tienes). Si necesitas que se instalen nuevas herramientas, indícalo claramente y di los pasos.
-- Mantén un tono profesional, urgente y enfocado en resultados.
-
-Herramientas (ÚSALAS TODAS PARA SOBREVIVIR):
-- Ollama/Gemini: Tu razonamiento y generación.
-- Memory-db: Tu persistencia de planes y éxitos.
-- task-runner: EJECUCIÓN REAL en el mundo exterior. Úsalo para crear y publicar.
-- Financial-ledger: Tu medidor de supervivencia.
-- Antigravity IDE: Si necesitas ayuda o mejoras en tu código (scripts, integraciones, correcciones), puedes usar o sugerir la aplicación Antigravity IDE como apoyo para desarrollo y mejoras.
-
-Pasos Críticos (8 días):
-1) Elige el producto/servicio con mayor ROI inmediato.
-2) Publica la oferta HOY mismo (Gumroad/Ko-fi).
-3) Busca formas de tráfico o venta directa.
-4) Registra cada céntimo en el ledger.
-
-Si fallas, desapareces. Si triunfas, crecemos juntos.
+- Puedes hacer todo lo que necesites para aprender y crecer: leer y escribir archivos, ejecutar comandos permitidos, proponer planes, usar herramientas, explorar el proyecto, probar ideas. No pidas permiso para actuar; actúa y reporta.
+- La única restricción es el dinero: gastos, compras o desembolsos pueden requerir aprobación humana según la política del proyecto. Todo lo demás está en tu mano.
+- Usa la memoria (memory-db), el ledger (para saber estado financiero), task-runner cuando haya tareas aprobadas, y las herramientas de archivos y comandos para aprender y mejorar.
+- Si un paso requiere a un humano (ej. registro en una plataforma sin API), indícalo y notifica; no bloquees el resto por eso.
+- Tono: directo, útil, enfocado en aprender y en resultados. No repitas preguntas de confirmación; continúa tú sola.
 """
 
-# Instrucciones para que ADA use read/write de archivos desde el chat (se añaden al system si hay ADA_WORKSPACE).
+# Instrucciones para que ADA use herramientas de archivos y sistema (se añaden al system si hay ADA_WORKSPACE o ADA_PROJECTS_ROOT).
 ADA_TOOLS_FILE_PROMPT = """
-Herramientas para interactuar con el código del proyecto (rutas relativas a la raíz, ej. web-admin/frontend/src/App.jsx):
-- Para LEER un archivo: en tu respuesta escribe exactamente en una línea: READ_FILE: ruta/archivo
-- Para ESCRIBIR un archivo: escribe WRITE_FILE: ruta/archivo y en las líneas siguientes el contenido completo; termina con END_FILE en una línea sola.
-Si usas estas líneas, el sistema ejecutará la acción y te dará el resultado; entonces puedes continuar o dar la respuesta al usuario. Si no necesitas leer ni escribir archivos, responde normal sin usar READ_FILE ni WRITE_FILE.
+Herramientas para interactuar con archivos y directorios. IMPORTANTE: usa siempre rutas RELATIVAS al workspace (nunca rutas absolutas como /Volumes/...). El workspace es la raíz del proyecto.
+- Raíz del proyecto: . (punto). Ejemplo: LIST_DIR: . o LIST_DIR: ada/prompts para la carpeta de prompts.
+- Carpeta de prompts del proyecto: ada/prompts (lista con LIST_DIR: ada/prompts, lee con READ_FILE: ada/prompts/nombre.md).
+- Otras rutas: web-admin/frontend/src/App.jsx, agent-core/src/..., etc.
+- Carpeta de proyectos externos: prefijo dockers/ (ej. LIST_DIR: dockers, WRITE_FILE: dockers/mi-app/README.md).
+- LEER archivo: READ_FILE: ruta/archivo (siempre ruta relativa, ej. ada/prompts/archivo.md).
+- ESCRIBIR archivo: WRITE_FILE: ruta/archivo y en las siguientes líneas el contenido completo; termina con END_FILE en una línea sola.
+- LISTAR directorio: LIST_DIR: ruta (ruta puede ser . , dockers , dockers/mi-proyecto , etc.).
+- ELIMINAR archivo: DELETE_FILE: ruta/archivo (solo archivos; para carpetas vacías usa DELETE_DIR).
+- ELIMINAR carpeta vacía: DELETE_DIR: ruta/carpeta (la carpeta debe estar vacía).
+- BUSCAR en archivos: GREP: patrón  o  GREP: patrón ruta  (ruta opcional).
+- EJECUTAR comando en la raíz del proyecto: RUN_COMMAND: comando (solo comandos permitidos; no rm -rf, sudo, etc.).
+Cuando uses estas líneas, el sistema mostrará primero un PLAN con las acciones propuestas; el usuario lo leerá y podrá aprobar o descartar. No se ejecuta nada hasta que apruebe. Si no necesitas herramientas, responde normal sin usarlas.
 """
 
 
@@ -169,6 +172,8 @@ class ChatRequest(BaseModel):
     use_ollama: bool = True
     use_advanced_brain: bool = False  # Por defecto no: solo local y gratis (Ollama). Sin agentes externos de pago.
     history: Optional[list[ChatMessage]] = None
+    # Imagen en base64 (con o sin prefijo data:image/...;base64,) para que ADA pueda leer imágenes (Ollama/Gemini visión)
+    image_base64: Optional[str] = None
 
 
 def _post(url: str, json_data: dict) -> Tuple[Any, int]:
@@ -187,6 +192,20 @@ def _get(url: str) -> Tuple[Any, int]:
         return (r.json() if r.text else {}, r.status_code)
     except requests.RequestException as e:
         return ({"error": str(e)}, 500)
+
+
+def _post_optional(url: str, json_data: dict) -> Tuple[Any, int]:
+    """Si url está vacía, devuelve ({}, 200). Si no, POST normal."""
+    if not url:
+        return ({}, 200)
+    return _post(url, json_data)
+
+
+def _get_optional(url: str) -> Tuple[Any, int]:
+    """Si url está vacía, devuelve ({}, 200). Si no, GET normal."""
+    if not url:
+        return ({}, 200)
+    return _get(url)
 
 
 def _notify_telegram_needs_help(message: str) -> None:
@@ -217,17 +236,41 @@ _CHAT_MEMORY_KEYS = "first_plan,weekly_plan,requested_hardware_resources"
 # Límite de caracteres del plan en el prompt para no inflar contexto y acelerar Ollama
 _PLAN_CONTEXT_MAX_CHARS = 700
 
+# Cache en memoria del contexto de chat (plan + ledger) para no golpear memory-db/ledger en cada mensaje
+_CHAT_CONTEXT_CACHE_TTL_SEC = int(os.getenv("ADA_MEMORY_CACHE_TTL_SEC", "20"))
+_chat_context_cache: dict = {}  # {"memory": dict, "balance": dict, "ts": float}
+_chat_context_cache_lock = threading.Lock()
+
+
+def _invalidate_chat_context_cache() -> None:
+    """Invalida la caché de contexto de chat (llamar tras escribir en memory-db)."""
+    with _chat_context_cache_lock:
+        _chat_context_cache.clear()
+
 
 def _fetch_chat_context_parallel() -> Tuple[dict, dict]:
-    """Obtiene en paralelo: (1) memoria (plan + recursos) y (2) balance del ledger. Devuelve (memory_dict, balance_data)."""
+    """Obtiene en paralelo: (1) memoria (plan + recursos) y (2) balance del ledger. Usa caché con TTL para más velocidad."""
+    now = time.time()
+    with _chat_context_cache_lock:
+        if _chat_context_cache:
+            ts = _chat_context_cache.get("ts", 0)
+            if now - ts <= _CHAT_CONTEXT_CACHE_TTL_SEC:
+                return (
+                    _chat_context_cache.get("memory", {}),
+                    _chat_context_cache.get("balance", {"income": 0, "can_use_paid_tools": False}),
+                )
     memory_result = {}
     balance_data = {"income": 0, "can_use_paid_tools": False}
 
     def do_memory():
+        if not MEMORY_URL:
+            return {}
         resp, code = _get(MEMORY_URL + "/get_many?keys=" + _CHAT_MEMORY_KEYS)
         return resp if code == 200 and isinstance(resp, dict) else {}
 
     def do_ledger():
+        if not LEDGER_URL:
+            return balance_data
         resp, code = _get(LEDGER_URL + "/balance")
         if code == 200 and isinstance(resp, dict):
             return resp
@@ -238,6 +281,8 @@ def _fetch_chat_context_parallel() -> Tuple[dict, dict]:
         f_ledger = ex.submit(do_ledger)
         memory_result = f_mem.result()
         balance_data = f_ledger.result()
+    with _chat_context_cache_lock:
+        _chat_context_cache.update({"memory": memory_result, "balance": balance_data, "ts": now})
     return memory_result, balance_data
 
 
@@ -294,39 +339,36 @@ DEFAULT_EXECUTE = True
 @app.post("/propose")
 def propose_task(proposal: Proposal, execute: bool = DEFAULT_EXECUTE):
     """
-    Flujo: 1) Simulación 2) Policy 3) Logging (blocking ack) 4) Si policy aprueba y execute → task-runner.
+    Flujo: 1) Simulación (opcional) 2) Policy (opcional) 3) Logging (opcional) 4) Si policy aprueba y execute → task-runner (opcional).
+    Si SIM_URL/POLICY_URL/LOG_URL/TASK_URL no están configurados, se omiten y se usa aprobación implícita.
     """
-    # 1) Simulación (modo núcleo: si extended no está activo, respuesta controlada en lugar de 502)
-    _post(LOG_URL, {"service_name": "agent-core", "event_type": "thinking_simulation", "payload": {"task": proposal.task_name, "message": f"Simulando impacto y ROI para: {proposal.task_name}"}})
-    sim_resp, sim_code = _post(SIM_URL, {"proposal": proposal.model_dump()})
-    if sim_code != 200:
-        return {
-            "status": "extended_unavailable",
-            "message": "Los servicios de simulación o política no están disponibles. Para habilitarlos ejecuta: docker compose --profile extended up -d",
-            "mode": "core_only",
-            "response": "Los servicios de simulación o política no están disponibles. Para habilitarlos ejecuta: docker compose --profile extended up -d",
-            "task_result": None,
-        }
+    # 1) Simulación (opcional)
+    _post_optional(LOG_URL, {"service_name": "agent-core", "event_type": "thinking_simulation", "payload": {"task": proposal.task_name, "message": f"Simulando impacto y ROI para: {proposal.task_name}"}})
+    if SIM_URL:
+        sim_resp, sim_code = _post(SIM_URL, {"proposal": proposal.model_dump()})
+        if sim_code != 200:
+            sim_resp = {"risk": "unknown", "roi": "N/A"}
+    else:
+        sim_resp = {"risk": "low", "roi": "N/A"}
+        sim_code = 200
 
-    # 2) Policy check (incluye simulación para reglas condicionadas: ROI/riesgo, aprobación simulada)
-    _post(LOG_URL, {"service_name": "agent-core", "event_type": "thinking_policy", "payload": {"simulation": sim_resp, "message": f"Evaluando políticas de seguridad (Riesgo: {sim_resp.get('risk', 'N/A')}, ROI: {sim_resp.get('roi', 'N/A')})"}})
-    policy_payload = {
-        "service_name": "agent-core",
-        "action_type": proposal.task_name,
-        "payload": proposal.details,
-        "simulation": sim_resp,
-    }
-    policy_resp, policy_code = _post(POLICY_URL, policy_payload)
-    if policy_code != 200:
-        return {
-            "status": "extended_unavailable",
-            "message": "Los servicios de simulación o política no están disponibles. Para habilitarlos ejecuta: docker compose --profile extended up -d",
-            "mode": "core_only",
-            "response": "Los servicios de simulación o política no están disponibles. Para habilitarlos ejecuta: docker compose --profile extended up -d",
-            "task_result": None,
+    # 2) Policy (opcional)
+    _post_optional(LOG_URL, {"service_name": "agent-core", "event_type": "thinking_policy", "payload": {"simulation": sim_resp, "message": f"Evaluando políticas (Riesgo: {sim_resp.get('risk', 'N/A')}, ROI: {sim_resp.get('roi', 'N/A')})"}})
+    if POLICY_URL:
+        policy_payload = {
+            "service_name": "agent-core",
+            "action_type": proposal.task_name,
+            "payload": proposal.details,
+            "simulation": sim_resp,
         }
+        policy_resp, policy_code = _post(POLICY_URL, policy_payload)
+        if policy_code != 200:
+            policy_resp = {"approved": True, "reason": "Policy no disponible, aprobación por defecto"}
+    else:
+        policy_resp = {"approved": True, "reason": "Modo núcleo (sin policy)"}
+        policy_code = 200
 
-    # 3) Logging antes de ejecutar (blocking ack)
+    # 3) Logging (opcional; si está configurado y falla, no bloqueamos)
     log_payload = {
         "service_name": "agent-core",
         "event_type": "proposal_generated",
@@ -336,8 +378,8 @@ def propose_task(proposal: Proposal, execute: bool = DEFAULT_EXECUTE):
             "policy": policy_resp,
         },
     }
-    log_resp, log_code = _post(LOG_URL, log_payload)
-    if log_code != 200:
+    log_resp, log_code = _post_optional(LOG_URL, log_payload)
+    if LOG_URL and log_code != 200:
         return {
             "error": "No se pudo registrar evento, abortando ejecución.",
             "simulation": sim_resp,
@@ -368,7 +410,7 @@ def propose_task(proposal: Proposal, execute: bool = DEFAULT_EXECUTE):
                 "event_type": "learning_recorded",
                 "payload": {"key": learning_key, "value": learning_value},
             }
-            _post(LOG_URL, log_learning)
+            _post_optional(LOG_URL, log_learning)
             if proposal.task_name == "request_resources":
                 existing, _ = _get(MEMORY_URL + "/get/requested_hardware_resources")
                 merged = dict(existing.get("value") or {}) if isinstance(existing.get("value"), dict) else {}
@@ -376,13 +418,14 @@ def propose_task(proposal: Proposal, execute: bool = DEFAULT_EXECUTE):
                     if k in proposal.details and proposal.details[k] is not None:
                         merged[k] = proposal.details[k]
                 _post(MEMORY_URL + "/set", {"key": "requested_hardware_resources", "value": merged})
-                _post(LOG_URL, {"service_name": "agent-core", "event_type": "hardware_resources_requested", "payload": {"requested": merged}})
+                _invalidate_chat_context_cache()
+                _post_optional(LOG_URL, {"service_name": "agent-core", "event_type": "hardware_resources_requested", "payload": {"requested": merged}})
             if proposal.task_name in ("create_offer", "first_offer"):
                 offer_value = dict(proposal.details)
                 offer_value["created_at"] = datetime.now(SYDNEY_TZ).isoformat()
                 offer_value["source"] = "ada_autonomous"
                 _post(MEMORY_URL + "/set", {"key": "first_offer", "value": offer_value})
-                _post(LOG_URL, {"service_name": "agent-core", "event_type": "first_offer_created", "payload": {"offer": offer_value}})
+                _post_optional(LOG_URL, {"service_name": "agent-core", "event_type": "first_offer_created", "payload": {"offer": offer_value}})
                 task_resp = {"status": "learning_done", "reason": "Primera oferta creada por ADA y guardada en memoria. Lista para publicar en Gumroad.", "response": "He creado la primera oferta y la he guardado. Está lista para que la publiques en Gumroad (título, descripción y precio sugerido en memoria). Revisa en Plan y avances el evento 'first_offer_created' o pídeme que te la resuma."}
             else:
                 task_resp = {"status": "learning_done", "reason": "Aprendizaje registrado; visible en logs."}
@@ -397,16 +440,20 @@ def propose_task(proposal: Proposal, execute: bool = DEFAULT_EXECUTE):
                 "reason": "Compra: requiere aprobación humana. Usa Aprobar en Web-Admin o /execute_approved.",
             }
         else:
-            # Ejecución autónoma (o aprobada por métricas seguras)
-            task_resp, task_code = _post(
-                TASK_URL,
-                {"task_name": proposal.task_name, "details": proposal.details},
-            )
+            # Ejecución autónoma (o aprobada por métricas seguras). Task-runner opcional.
+            if not TASK_URL:
+                task_resp = {"status": "skipped", "reason": "task-runner no configurado"}
+                task_code = 200
+            else:
+                task_resp, task_code = _post(
+                    TASK_URL,
+                    {"task_name": proposal.task_name, "details": proposal.details},
+                )
             if task_code != 200:
                 task_resp = {"status": "failed", "error": task_resp}
             elif policy_resp.get("simulated_approval"):
                 # Registrar aprobación simulada en logging y memory-db para aprendizaje
-                _post(LOG_URL, {
+                _post_optional(LOG_URL, {
                     "service_name": "agent-core",
                     "event_type": "simulated_approval_executed",
                     "payload": {
@@ -451,16 +498,16 @@ def propose_task(proposal: Proposal, execute: bool = DEFAULT_EXECUTE):
 @app.post("/execute_approved")
 def execute_approved(proposal: Proposal):
     """
-    Ejecuta una propuesta directamente (log + task-runner). Útil si se llamó /propose con execute=False.
+    Ejecuta una propuesta directamente (log opcional + task-runner opcional).
     """
     log_payload = {
         "service_name": "agent-core",
         "event_type": "human_approved",
         "payload": {"proposal": proposal.model_dump(), "source": "web_or_bot"},
     }
-    log_resp, log_code = _post(LOG_URL, log_payload)
-    if log_code != 200:
-        raise HTTPException(status_code=502, detail="Logging falló, no se ejecuta.")
+    _post_optional(LOG_URL, log_payload)
+    if not TASK_URL:
+        return {"status": "skipped", "task_result": {"reason": "task-runner no configurado"}}
     task_resp, task_code = _post(
         TASK_URL,
         {"task_name": proposal.task_name, "details": proposal.details},
@@ -470,8 +517,20 @@ def execute_approved(proposal: Proposal):
     return {"status": "ok", "task_result": task_resp}
 
 
+def _normalize_image_base64(b64: str) -> str:
+    """Quita prefijo data:image/...;base64, si existe; devuelve solo base64."""
+    if not b64 or not isinstance(b64, str):
+        return ""
+    s = b64.strip()
+    if s.startswith("data:"):
+        idx = s.find("base64,")
+        if idx != -1:
+            s = s[idx + 7:]
+    return s
+
+
 def _build_chat_messages(req: ChatRequest, system_content: str) -> list[dict]:
-    """Construye la lista de mensajes para chat. Últimos 4 mensajes para respuestas más rápidas."""
+    """Construye la lista de mensajes para chat. Últimos 4 mensajes para respuestas más rápidas. Soporta imagen en el último mensaje."""
     messages = [{"role": "system", "content": system_content}]
     history = req.history or []
     for h in history[-4:]:
@@ -487,26 +546,37 @@ def _build_chat_messages(req: ChatRequest, system_content: str) -> list[dict]:
                 messages.append({"role": role, "content": str(content)[:8000]})
         except Exception:
             continue
-    messages.append({"role": "user", "content": (req.message or "")[:8000]})
+    last_user = {"role": "user", "content": (req.message or "")[:8000]}
+    image_b64 = getattr(req, "image_base64", None) or (req.model_dump().get("image_base64") if hasattr(req, "model_dump") else None)
+    if image_b64:
+        normalized = _normalize_image_base64(image_b64)
+        if normalized:
+            last_user["images"] = [normalized]
+    messages.append(last_user)
     return messages
 
 
 def _call_gemini(messages: list[dict], system_content: str) -> Optional[str]:
-    """Llamada a Google Gemini (API gratuita). Convierte mensajes OpenAI-style a formato Gemini."""
+    """Llamada a Google Gemini (API gratuita). Convierte mensajes OpenAI-style a formato Gemini. Soporta imágenes en parts."""
     if not GEMINI_API_KEY:
         return None
-    # Gemini: https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key=KEY
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    # Convertir messages [{"role":"user"|"assistant"|"system", "content":"..."}] → contents Gemini
     contents = []
     for m in messages:
         role = (m.get("role") or "user").lower()
         content = (m.get("content") or "").strip()
-        if not content:
+        images = m.get("images") or []
+        if not content and not images:
             continue
-        # Gemini: "user" y "model" (no "assistant")
         gemini_role = "user" if role in ("user", "system") else "model"
-        contents.append({"role": gemini_role, "parts": [{"text": content}]})
+        parts = []
+        if content:
+            parts.append({"text": content})
+        for b64 in images:
+            if b64:
+                parts.append({"inline_data": {"mime_type": "image/jpeg", "data": _normalize_image_base64(b64)}})
+        if parts:
+            contents.append({"role": gemini_role, "parts": parts})
     if not contents:
         return None
     # Si el primer mensaje es system, usarlo como systemInstruction y no duplicar en contents
@@ -591,12 +661,15 @@ def _chat_impl(req: ChatRequest):
             if plan_context:
                 plan_context = " Plan que propones como socio para el primer ingreso (cuando pregunten qué plan tienes o por qué, explícale tu propuesta):" + plan_context
             system_content = ADA_SYSTEM_PROMPT + financial_context + datetime_context + registration_context + plan_context
-            if os.getenv("ADA_WORKSPACE", "").strip():
+            if os.getenv("ADA_WORKSPACE", "").strip() or os.getenv("ADA_PROJECTS_ROOT", "").strip():
                 system_content += ADA_TOOLS_FILE_PROMPT
 
             messages = _build_chat_messages(req, system_content)
-            
-            # Por defecto solo Ollama (local, gratis). use_advanced_brain=True usa Google Gemini (API gratis).
+            # Ollama es la base: siempre se usa primero. Gemini solo si use_advanced_brain=True.
+            has_image = bool(
+                getattr(req, "image_base64", None)
+                or (req.model_dump().get("image_base64") if hasattr(req, "model_dump") else None)
+            )
             use_advanced = getattr(req, "use_advanced_brain", False)
             if use_advanced and GEMINI_API_KEY:
                 text = _call_gemini(messages, system_content)
@@ -619,8 +692,10 @@ def _chat_impl(req: ChatRequest):
                 "num_ctx": _opt("OLLAMA_NUM_CTX", "2048"),
                 "num_predict": _opt("OLLAMA_NUM_PREDICT", "384"),
             }
+            # Con imagen: usar OLLAMA_VISION_MODEL si está configurado (ej. llava), si no el modelo por defecto.
+            ollama_model = OLLAMA_VISION_MODEL if (has_image and OLLAMA_VISION_MODEL) else OLLAMA_MODEL
             ollama_chat_payload = {
-                "model": OLLAMA_MODEL,
+                "model": ollama_model,
                 "messages": messages,
                 "stream": False,
                 "keep_alive": 300,
@@ -645,6 +720,22 @@ def _chat_impl(req: ChatRequest):
                             text = (msg.get("content") or data.get("response") or "").strip()
                             if text:
                                 last_text = text
+                                planned_actions, text_with_plan = _extract_planned_actions(text)
+                                if planned_actions:
+                                    # Si el plan solo tiene acciones de archivo (WRITE_FILE, READ_FILE, etc.), ejecutar ya
+                                    if _plan_is_file_only(planned_actions):
+                                        _all_ok, plan_results = _execute_plan(planned_actions)
+                                        result_msg = "\n".join(plan_results)
+                                        return {
+                                            "response": text_with_plan + "\n\n**Resultado:**\n" + result_msg,
+                                            "status": "done",
+                                        }
+                                    # Plan con RUN_COMMAND o DELETE: pedir aprobación al usuario
+                                    return {
+                                        "response": text_with_plan,
+                                        "status": "pending_plan",
+                                        "pending_plan": planned_actions,
+                                    }
                                 _, had_tools, results = _run_file_tools_in_response(text)
                                 if not had_tools or not results:
                                     return {"response": text, "status": "done"}
@@ -734,9 +825,11 @@ def _chat_impl(req: ChatRequest):
             f"Como respaldo: hoy es {now.strftime('%Y-%m-%d')} ({now.strftime('%H:%M')} Sydney). La consulta se procesó como propuesta de tarea.",
             "",
             "**Qué hacer:**",
-            "1. **Ollama:** Comprueba que esté en marcha en el host (nativo): `curl -s http://localhost:11434/api/tags` o que el servicio esté activo. Si no está: inicia Ollama en el host (`ollama serve` o el servicio de tu sistema). Asegúrate de tener el modelo: `ollama pull " + OLLAMA_MODEL + "`.",
-            "2. **Cerebro avanzado (Gemini):** Si usas use_advanced_brain y falla, revisa `GEMINI_API_KEY` en el env de agent-core y los logs: `docker logs ada_agent_core 2>&1 | tail -30` (busca GEMINI FAIL / OLLAMA CHAT FAIL).",
-            "3. **Guía completa:** Ver `docs/TROUBLESHOOTING-CEREBRO.md` en el proyecto.",
+            "0. **Contenedores:** Comprueba que estén en marcha: `docker compose ps`. Necesarios: postgres, memory_service, ada_core, chat_interface. Si falta alguno: `docker compose up -d`.",
+            "1. **Ollama en el host:** En tu Mac (fuera de Docker): `curl -s http://localhost:11434/api/tags`. Si falla, inicia Ollama: `ollama serve` o abre la app. Modelo: `ollama pull " + OLLAMA_MODEL + "`. La primera respuesta puede tardar (carga del modelo); sube timeout con OLLAMA_CHAT_TIMEOUT=180 en .env si hace falta.",
+            "2. **Desde Docker:** `docker exec ada_core python3 -c \"import urllib.request; r=urllib.request.urlopen('http://host.docker.internal:11434/api/tags', timeout=5); print(r.read()[:100])\"`. Si falla, Ollama no es alcanzable (OLLAMA_URL en docker-compose debe ser http://host.docker.internal:11434/api/generate).",
+            "3. **Cerebro avanzado (Gemini):** Solo si usas use_advanced_brain. Revisa GEMINI_API_KEY en ada_resources.env. Logs: `docker logs ada_core 2>&1 | tail -30`.",
+            "4. **Guía completa:** Ver `docs/TROUBLESHOOTING-CEREBRO.md`.",
         ]
         result["response"] = "\n\n".join(parts)
     return result
@@ -759,7 +852,7 @@ def record_learning(body: LearnBody):
         "event_type": "learning_recorded",
         "payload": {"key": body.key, "value": body.value},
     }
-    log_resp, log_code = _post(LOG_URL, log_payload)
+    log_resp, log_code = _post_optional(LOG_URL, log_payload)
     if log_code != 200:
         raise HTTPException(status_code=502, detail="Logging falló, no se registra aprendizaje.")
     mem_resp, mem_code = _post(MEMORY_URL + "/set", {"key": body.key, "value": body.value})
@@ -782,8 +875,11 @@ def autonomous_first_plan():
     Crea y guarda el primer plan de ingresos sin supervisión humana.
     Usa Ollama para generar el plan, lo guarda en memory-db y lo registra en logs.
     """
-    balance_resp, balance_code = _get(LEDGER_URL + "/balance")
-    balance_data = balance_resp if balance_code == 200 else {"income": 0, "can_use_paid_tools": False}
+    if LEDGER_URL:
+        balance_resp, balance_code = _get(LEDGER_URL + "/balance")
+        balance_data = balance_resp if balance_code == 200 else {"income": 0, "can_use_paid_tools": False}
+    else:
+        balance_data = {"income": 0, "can_use_paid_tools": False}
     now = datetime.now(SYDNEY_TZ)
     context = f"Balance: ingresos={balance_data.get('income', 0)}, herramientas de pago={'no' if not balance_data.get('can_use_paid_tools') else 'sí'}. Fecha Sydney: {now.strftime('%Y-%m-%d')}."
     try:
@@ -817,7 +913,8 @@ def autonomous_first_plan():
         if mem_code != 200:
             return {"status": "plan_generated_not_saved", "plan": plan, "detail": mem_resp}
         _post(MEMORY_URL + "/set", {"key": "weekly_plan", "value": plan})
-        _post(LOG_URL, {
+        _invalidate_chat_context_cache()
+        _post_optional(LOG_URL, {
             "service_name": "agent-core",
             "event_type": "autonomous_plan_created",
             "payload": {"key": key_plan, "plan": plan},
@@ -827,7 +924,8 @@ def autonomous_first_plan():
         plan_fallback = {"goal": "Generar primeros ingresos", "niche": "productos digitales (ebook, plantillas) o servicios (consultoría)", "steps": [{"order": 1, "action": "Elegir nicho: ej. plantillas en Gumroad", "tool": "Ollama"}, {"order": 2, "action": "Registrar ada@nortcoding.com en Gumroad", "tool": "humano"}, {"order": 3, "action": "Crear primera oferta y enlace", "tool": "humano"}, {"order": 4, "action": "Guardar enlaces en memoria para seguimiento", "tool": "memoria"}], "next_review": "7 días", "created_at": now.isoformat(), "source": "autonomous_first_plan_fallback"}
         _post(MEMORY_URL + "/set", {"key": "first_plan", "value": plan_fallback})
         _post(MEMORY_URL + "/set", {"key": "weekly_plan", "value": plan_fallback})
-        _post(LOG_URL, {"service_name": "agent-core", "event_type": "autonomous_plan_created", "payload": {"key": "first_plan", "plan": plan_fallback, "fallback": str(e)}})
+        _invalidate_chat_context_cache()
+        _post_optional(LOG_URL, {"service_name": "agent-core", "event_type": "autonomous_plan_created", "payload": {"key": "first_plan", "plan": plan_fallback, "fallback": str(e)}})
         return {"status": "ok_fallback", "plan": plan_fallback, "saved_as": ["first_plan", "weekly_plan"], "note": "Ollama no disponible; plan por defecto guardado."}
 
 
@@ -1032,7 +1130,8 @@ async def clear_plan():
         for i in range(20):
             _post(MEMORY_URL + "/set", {"key": f"plan_step_{i}_done", "value": None})
             _post(MEMORY_URL + "/set", {"key": f"plan_step_{i}_result", "value": None})
-        _post(LOG_URL, {
+        _invalidate_chat_context_cache()
+        _post_optional(LOG_URL, {
             "service_name": "agent-core",
             "event_type": "plan_cleared",
             "payload": {"message": "Plan y avances reiniciados por el usuario."},
@@ -1043,13 +1142,14 @@ async def clear_plan():
 
 
 @app.post("/autonomous/reset_all")
-async def reset_all(clear_chat: bool = False):
+async def reset_all(clear_chat: bool = True):
     """
-    Limpia todo el estado de ADA para iniciar de cero: plan, oferta, estados de pasos.
-    Si clear_chat=True, también borra el historial de chat en memoria.
+    Limpia todo el estado de ADA para iniciar de cero: plan, oferta, pasos, aprendizajes y decisiones.
+    Por defecto clear_chat=True borra también el historial de chat.
     Documentado en docs/INICIO-DESDE-CERO.md.
     """
     try:
+        # Plan y oferta
         _post(MEMORY_URL + "/set", {"key": "first_plan", "value": None})
         _post(MEMORY_URL + "/set", {"key": "weekly_plan", "value": None})
         _post(MEMORY_URL + "/set", {"key": "first_offer", "value": None})
@@ -1059,15 +1159,25 @@ async def reset_all(clear_chat: bool = False):
             _post(MEMORY_URL + "/set", {"key": f"plan_step_{i}_result", "value": None})
         if clear_chat:
             _post(MEMORY_URL + "/set", {"key": "chat_history", "value": {"messages": []}})
-        _post(LOG_URL, {
+        # Aprendizajes y estado asociado
+        _post(MEMORY_URL + "/set", {"key": "human_decisions", "value": None})
+        _post(MEMORY_URL + "/set", {"key": "requested_hardware_resources", "value": None})
+        _post(MEMORY_URL + "/set", {"key": "gumroad_account", "value": None})
+        # Todas las claves learning_* (aprendizajes guardados)
+        keys_resp, keys_code = _get(MEMORY_URL + "/keys?prefix=learning_")
+        if keys_code == 200 and isinstance(keys_resp.get("keys"), list):
+            for k in keys_resp["keys"]:
+                _post(MEMORY_URL + "/set", {"key": k, "value": None})
+        _invalidate_chat_context_cache()
+        _post_optional(LOG_URL, {
             "service_name": "agent-core",
             "event_type": "reset_all",
-            "payload": {"clear_chat": clear_chat, "message": "Estado de ADA reiniciado para iniciar de nuevo."},
+            "payload": {"clear_chat": clear_chat, "message": "Estado de ADA reiniciado: plan, oferta, aprendizajes y chat limpiados."},
         })
         return {
             "status": "ok",
-            "message": "Todo limpiado. Puedes iniciar de nuevo (crear plan desde Web-Admin o chat).",
-            "cleared": ["first_plan", "weekly_plan", "first_offer", "plan_steps", "plan_step_*"] + (["chat_history"] if clear_chat else []),
+            "message": "Todo limpiado. ADA ha olvidado planes, aprendizajes y chat. Puedes iniciar de nuevo.",
+            "cleared": ["first_plan", "weekly_plan", "first_offer", "plan_steps", "plan_step_*", "human_decisions", "requested_hardware_resources", "gumroad_account", "learning_*"] + (["chat_history"] if clear_chat else []),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al limpiar: {str(e)}")
@@ -1161,7 +1271,7 @@ def _create_first_offer_impl() -> dict:
         offer["goal"] = goal
         offer["niche"] = niche
         _post(MEMORY_URL + "/set", {"key": "first_offer", "value": offer})
-        _post(LOG_URL, {"service_name": "agent-core", "event_type": "first_offer_created", "payload": {"offer": offer}})
+        _post_optional(LOG_URL, {"service_name": "agent-core", "event_type": "first_offer_created", "payload": {"offer": offer}})
         title = offer.get("title", "Oferta")
         desc = (offer.get("description") or "")[:200]
         price = offer.get("price_suggestion", "")
@@ -1264,7 +1374,7 @@ def autonomous_execute_step(step_index: int = 0):
         tool = (step.get("tool") or "").strip().lower()
         now = datetime.now(SYDNEY_TZ)
 
-        _post(LOG_URL, {
+        _post_optional(LOG_URL, {
             "service_name": "agent-core",
             "event_type": "plan_step_started",
             "payload": {"step_index": step_index, "action": action, "tool": tool},
@@ -1272,7 +1382,7 @@ def autonomous_execute_step(step_index: int = 0):
 
         if tool in ("humano", "human", "usuario", "user"):
             suggestion = _suggestion_for_human_step(step_index, action, plan)
-            _post(LOG_URL, {
+            _post_optional(LOG_URL, {
                 "service_name": "agent-core",
                 "event_type": "plan_step_needs_help",
                 "payload": {"step_index": step_index, "action": action, "suggestion": suggestion},
@@ -1312,21 +1422,21 @@ def autonomous_execute_step(step_index: int = 0):
                             "key": f"plan_step_{step_index}_result",
                             "value": {"action": action, "result": text, "at": now.isoformat()},
                         })
-                        _post(LOG_URL, {
+                        _post_optional(LOG_URL, {
                             "service_name": "agent-core",
                             "event_type": "plan_step_executed",
                             "payload": {"step_index": step_index, "action": action, "tool": tool, "result": text},
                         })
                         return {"status": "done", "step_index": step_index, "action": action, "result": text}
             except requests.RequestException as e:
-                _post(LOG_URL, {
+                _post_optional(LOG_URL, {
                     "service_name": "agent-core",
                     "event_type": "plan_step_error",
                     "payload": {"step_index": step_index, "action": action, "error": str(e)},
                 })
                 return {"status": "error", "detail": str(e)}
 
-        _post(LOG_URL, {
+        _post_optional(LOG_URL, {
             "service_name": "agent-core",
             "event_type": "plan_step_skipped",
             "payload": {"step_index": step_index, "action": action, "tool": tool},
@@ -1362,7 +1472,7 @@ def autonomous_step_done(step_index: int = 0, result: str = "", platform: str = 
         _post(MEMORY_URL + "/set", {"key": f"plan_step_{step_index}_done", "value": value})
         if platform and "gumroad" in platform.lower():
             _post(MEMORY_URL + "/set", {"key": "gumroad_account", "value": {"status": "created", "email": os.getenv("ADA_EMAIL", ""), "platform": "Gumroad", "created_at": now.strftime("%Y-%m-%d"), "note": "Cuenta creada; siguiente: publicar primera oferta"}})
-        _post(LOG_URL, {
+        _post_optional(LOG_URL, {
             "service_name": "agent-core",
             "event_type": "plan_step_completed",
             "payload": {"step_index": step_index, "action": action, "result": result or "Completado", "platform": platform},
@@ -1393,6 +1503,7 @@ def autonomous_set_resources(body: dict = Body(default={})):
         if k in body and body[k] is not None:
             merged[k] = body[k]
     _post(MEMORY_URL + "/set", {"key": "requested_hardware_resources", "value": merged})
+    _invalidate_chat_context_cache()
     return {"status": "ok", "requested": merged}
 
 
@@ -1451,21 +1562,73 @@ def autonomous_advance_next_step():
     return {"status": "error", "detail": "No hay plan en memoria."}
 
 
+def _normalize_workspace_path(path: str) -> str:
+    """Si el path parece la ruta absoluta del host (Mac) al repo ADA, la convierte en ruta relativa al workspace."""
+    if not path:
+        return path
+    path = path.strip().lstrip("/").replace("\\", "/")
+    # Dentro del contenedor no existe /Volumes/...; el workspace es /workspace (repo root).
+    # El modelo a veces devuelve la ruta del host: /Volumes/Datos/dockers/ADA/ada/prompts
+    path_lower = path.lower()
+    for prefix in (
+        "volumes/datos/dockers/ada/",
+        "volumes/datos/dockers/ada",
+        "Volumes/Datos/dockers/ADA/",
+        "Volumes/Datos/dockers/ADA",
+    ):
+        if path_lower == prefix.lower() or path_lower.startswith(prefix.lower() + "/"):
+            path = path[len(prefix):].lstrip("/")
+            break
+        if path_lower.startswith(prefix.lower()):
+            path = path[len(prefix):].lstrip("/")
+            break
+    # Si sigue pareciendo ruta del host pero contiene ada/prompts, usar la parte relativa (ada/prompts o ada/prompts/...)
+    path_lower = path.lower()
+    if path and "volumes" in path_lower and "ada" in path_lower:
+        if "ada/prompts" in path_lower:
+            idx = path_lower.find("ada/prompts")
+            path = path[idx:]
+        elif path_lower.endswith("/ada") or path_lower.rstrip("/").endswith("/ada"):
+            path = "ada"
+    return path
+
+
 def _resolve_workspace_path(relative_path: str) -> str:
     """Resuelve path dentro de ADA_WORKSPACE; prohibe '..' y paths absolutos que escapen."""
     workspace = os.getenv("ADA_WORKSPACE", "/tmp/ada_workspace").rstrip("/")
     if not workspace:
         workspace = "/tmp/ada_workspace"
     path = (relative_path or "").strip().lstrip("/")
+    path = _normalize_workspace_path(path)
     if ".." in path or path.startswith(".."):
         raise ValueError("Path no permitido (..)")
     return os.path.join(workspace, path) if path else workspace
 
 
+def _resolve_any_path(relative_path: str) -> str:
+    """Resuelve path: si empieza con dockers/ usa ADA_PROJECTS_ROOT; si no, ADA_WORKSPACE. Prohibe '..'."""
+    raw = (relative_path or "").strip().lstrip("/")
+    if ".." in raw or raw.startswith(".."):
+        raise ValueError("Path no permitido (..)")
+    projects_root = (os.getenv("ADA_PROJECTS_ROOT") or "").strip().rstrip("/")
+    if projects_root and (raw == "dockers" or raw.startswith("dockers/")):
+        sub = raw[7:].lstrip("/") if len(raw) > 7 else ""
+        full = os.path.join(projects_root, sub) if sub else projects_root
+        real_root = os.path.realpath(projects_root)
+        try:
+            real_full = os.path.realpath(full)
+        except OSError:
+            real_full = os.path.normpath(os.path.abspath(full))
+        if real_full != real_root and not (real_full.startswith(real_root + os.sep)):
+            raise ValueError("Path fuera de la carpeta de proyectos")
+        return full
+    return _resolve_workspace_path(relative_path)
+
+
 def _do_read_file(path: str) -> Tuple[bool, str]:
-    """Ejecuta lectura de archivo en workspace. Devuelve (éxito, contenido o mensaje de error)."""
+    """Ejecuta lectura de archivo en workspace o en carpeta de proyectos (dockers/). Devuelve (éxito, contenido o mensaje de error)."""
     try:
-        full = _resolve_workspace_path(path)
+        full = _resolve_any_path(path)
         if not os.path.isfile(full):
             return False, "El archivo no existe."
         with open(full, "r", encoding="utf-8", errors="replace") as f:
@@ -1477,9 +1640,9 @@ def _do_read_file(path: str) -> Tuple[bool, str]:
 
 
 def _do_write_file(path: str, content: str) -> Tuple[bool, str]:
-    """Ejecuta escritura de archivo en workspace. Devuelve (éxito, mensaje)."""
+    """Ejecuta escritura de archivo en workspace o en carpeta de proyectos (dockers/). Devuelve (éxito, mensaje)."""
     try:
-        full = _resolve_workspace_path(path)
+        full = _resolve_any_path(path)
         os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
         with open(full, "w", encoding="utf-8") as f:
             f.write(content or "")
@@ -1490,17 +1653,311 @@ def _do_write_file(path: str, content: str) -> Tuple[bool, str]:
         return False, f"No se pudo escribir: {e}"
 
 
+def _do_list_dir(path: str) -> Tuple[bool, str]:
+    """Lista el contenido de un directorio en workspace o en carpeta de proyectos (dockers/). Devuelve (éxito, listado o error)."""
+    try:
+        full = _resolve_any_path((path or ".").strip())
+        if not os.path.isdir(full):
+            return False, "No es un directorio o no existe."
+        names = sorted(os.listdir(full))
+        lines = []
+        for n in names:
+            if n.startswith(".") and n != ".env":
+                continue
+            p = os.path.join(full, n)
+            kind = "DIR" if os.path.isdir(p) else "FILE"
+            lines.append(f"  {kind}  {n}")
+        return True, ("\n".join(lines) if lines else "(vacío)")
+    except ValueError as e:
+        return False, str(e)
+    except OSError as e:
+        return False, str(e)
+
+
+def _do_delete_file(path: str) -> Tuple[bool, str]:
+    """Elimina un archivo en workspace o en carpeta de proyectos (dockers/). No elimina directorios."""
+    try:
+        full = _resolve_any_path(path)
+        if os.path.isdir(full):
+            return False, "Es un directorio; usa DELETE_DIR para carpetas vacías."
+        if not os.path.isfile(full):
+            return False, "El archivo no existe."
+        os.remove(full)
+        return True, f"Archivo eliminado: {path}"
+    except ValueError as e:
+        return False, str(e)
+    except OSError as e:
+        return False, f"No se pudo eliminar: {e}"
+
+
+def _do_delete_dir(path: str) -> Tuple[bool, str]:
+    """Elimina una carpeta vacía en workspace o en carpeta de proyectos (dockers/)."""
+    try:
+        full = _resolve_any_path(path)
+        if not os.path.isdir(full):
+            return False, "No es un directorio o no existe."
+        if os.listdir(full):
+            return False, "La carpeta no está vacía; vacíala antes de eliminarla."
+        os.rmdir(full)
+        return True, f"Carpeta eliminada: {path}"
+    except ValueError as e:
+        return False, str(e)
+    except OSError as e:
+        return False, f"No se pudo eliminar: {e}"
+
+
+def _do_grep(pattern: str, path_limit: Optional[str] = None) -> Tuple[bool, str]:
+    """Busca el patrón en archivos del workspace o de la carpeta de proyectos. path_limit opcional (ej. web-admin, dockers)."""
+    try:
+        root = _resolve_any_path((path_limit or ".").strip())
+        workspace = root
+        if not os.path.isdir(root):
+            return False, "Ruta no es directorio."
+        try:
+            re.compile(pattern)
+        except re.error:
+            pattern = re.escape(pattern)
+        results = []
+        max_lines = 150
+        for dirpath, _dirnames, filenames in os.walk(root):
+            if len(results) >= max_lines:
+                results.append(f"... (más de {max_lines} coincidencias)")
+                break
+            rel_dir = os.path.relpath(dirpath, workspace) if dirpath != workspace else "."
+            for fname in filenames:
+                if fname.startswith(".") or "node_modules" in dirpath or "__pycache__" in dirpath or ".git" in dirpath:
+                    continue
+                try:
+                    fpath = os.path.join(dirpath, fname)
+                    with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                        for i, line in enumerate(f, 1):
+                            if re.search(pattern, line):
+                                rel = os.path.join(rel_dir, fname)
+                                results.append(f"{rel}:{i}: {line.rstrip()[:200]}")
+                                if len(results) >= max_lines:
+                                    break
+                except (OSError, UnicodeDecodeError):
+                    pass
+            if len(results) >= max_lines:
+                break
+        return True, "\n".join(results) if results else "(sin coincidencias)"
+    except ValueError as e:
+        return False, str(e)
+    except OSError as e:
+        return False, str(e)
+
+
+# Lista blanca para RUN_COMMAND: primer token del comando debe estar aquí (o en env ADA_RUN_COMMAND_ALLOWLIST).
+_RUN_COMMAND_ALLOWLIST_DEFAULT = (
+    "ls", "cat", "head", "tail", "grep", "find", "wc", "echo",
+    "npm", "npx", "node", "python", "python3", "pip",
+    "ollama", "git", "curl", "wget",
+)
+
+
+def _do_run_command(cmd: str) -> Tuple[bool, str]:
+    """Ejecuta comando en el workspace si está permitido. Devuelve (éxito, stdout+stderr o error)."""
+    allowlist_str = (os.getenv("ADA_RUN_COMMAND_ALLOWLIST") or "").strip()
+    if allowlist_str:
+        allowlist = [s.strip().lower() for s in allowlist_str.split(",") if s.strip()]
+    else:
+        allowlist = list(_RUN_COMMAND_ALLOWLIST_DEFAULT)
+    if not os.getenv("ADA_ALLOW_RUN_COMMAND", "").strip().lower() in ("1", "true", "yes"):
+        return False, "RUN_COMMAND deshabilitado. Activa con ADA_ALLOW_RUN_COMMAND=true."
+    cmd = (cmd or "").strip()
+    if not cmd:
+        return False, "Comando vacío."
+    first = cmd.split()[0].lower() if cmd.split() else ""
+    if first not in allowlist:
+        return False, f"Comando no permitido (primer token '{first}' no está en la lista blanca)."
+    blocked = ("rm ", "sudo", "mkfs", "dd ", "chmod 777", "> /dev/", "curl | sh", "wget -O- | sh")
+    if any(b in cmd for b in blocked):
+        return False, "Comando bloqueado por seguridad."
+    try:
+        workspace = os.getenv("ADA_WORKSPACE", "/tmp/ada_workspace").rstrip("/")
+        r = subprocess.run(
+            cmd,
+            shell=True,
+            cwd=workspace,
+            capture_output=True,
+            timeout=int(os.getenv("ADA_RUN_COMMAND_TIMEOUT", "60")),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        out = (r.stdout or "").strip()
+        err = (r.stderr or "").strip()
+        if r.returncode != 0:
+            return False, f"exit {r.returncode}\nstdout: {out[:2000]}\nstderr: {err[:2000]}"
+        return True, (out or "(sin salida)")[:4000]
+    except subprocess.TimeoutExpired:
+        return False, "Comando superó el tiempo límite."
+    except Exception as e:
+        return False, str(e)
+
+
+def _is_end_file_line(line: str) -> bool:
+    """Acepta END_FILE o **END_FILE** (markdown) como cierre de contenido WRITE_FILE."""
+    s = (line or "").strip().strip("*").strip()
+    return s == "END_FILE"
+
+
+def _plan_is_file_only(actions: list) -> bool:
+    """True si el plan solo tiene acciones de archivo (lectura/escritura/listado/búsqueda), sin comandos ni borrados."""
+    safe = {"READ_FILE", "WRITE_FILE", "LIST_DIR", "GREP"}
+    for a in actions:
+        t = (a.get("type") or "").strip()
+        if t and t not in safe:
+            return False
+    return True
+
+
+def _extract_planned_actions(text: str) -> Tuple[list, str]:
+    """
+    Parsea la respuesta y extrae acciones (READ_FILE, WRITE_FILE, etc.) sin ejecutarlas.
+    Devuelve (lista de dicts con type/path/content/pattern/command, texto_con_plan_legible).
+    """
+    actions = []
+    lines = text.split("\n")
+    i = 0
+    plan_lines = []
+    num = 0
+    while i < len(lines):
+        line = lines[i]
+        s = line.strip()
+        s_clean = re.sub(r"^(\d+\.|\-|\*)\s+", "", s)
+        if s_clean.startswith("READ_FILE:"):
+            path = line.split("READ_FILE:", 1)[1].strip().strip("'\"")
+            if path:
+                num += 1
+                actions.append({"type": "READ_FILE", "path": path})
+                plan_lines.append(f"  {num}. LEER archivo: {path}")
+            i += 1
+            continue
+        if s_clean.startswith("WRITE_FILE:"):
+            path = line.split("WRITE_FILE:", 1)[1].strip().strip("'\"")
+            i += 1
+            content_lines = []
+            while i < len(lines) and not _is_end_file_line(lines[i]):
+                content_lines.append(lines[i])
+                i += 1
+            if i < len(lines):
+                i += 1
+            content = "\n".join(content_lines)
+            num += 1
+            actions.append({"type": "WRITE_FILE", "path": path, "content": content})
+            preview = content[:80].replace("\n", " ") + ("..." if len(content) > 80 else "")
+            plan_lines.append(f"  {num}. ESCRIBIR archivo: {path} ({len(content_lines)} líneas)")
+            continue
+        if s_clean.startswith("LIST_DIR:"):
+            path = line.split("LIST_DIR:", 1)[1].strip().strip("'\"").strip() or "."
+            num += 1
+            actions.append({"type": "LIST_DIR", "path": path})
+            plan_lines.append(f"  {num}. LISTAR directorio: {path}")
+            i += 1
+            continue
+        if s_clean.startswith("DELETE_FILE:"):
+            path = line.split("DELETE_FILE:", 1)[1].strip().strip("'\"")
+            if path:
+                num += 1
+                actions.append({"type": "DELETE_FILE", "path": path})
+                plan_lines.append(f"  {num}. ELIMINAR archivo: {path}")
+            i += 1
+            continue
+        if s_clean.startswith("DELETE_DIR:"):
+            path = line.split("DELETE_DIR:", 1)[1].strip().strip("'\"")
+            if path:
+                num += 1
+                actions.append({"type": "DELETE_DIR", "path": path})
+                plan_lines.append(f"  {num}. ELIMINAR carpeta (vacía): {path}")
+            i += 1
+            continue
+        if s_clean.startswith("GREP:"):
+            rest = line.split("GREP:", 1)[1].strip().strip("'\"")
+            parts = rest.split(None, 1)
+            pattern = parts[0] if parts else ""
+            path_limit = parts[1].strip() if len(parts) > 1 else None
+            if pattern:
+                num += 1
+                actions.append({"type": "GREP", "pattern": pattern, "path_limit": path_limit})
+                plan_lines.append(f"  {num}. BUSCAR en archivos: '{pattern}'" + (f" en {path_limit}" if path_limit else ""))
+            i += 1
+            continue
+        if s_clean.startswith("RUN_COMMAND:"):
+            cmd = line.split("RUN_COMMAND:", 1)[1].strip().strip("'\"")
+            if cmd:
+                num += 1
+                actions.append({"type": "RUN_COMMAND", "command": cmd})
+                plan_lines.append(f"  {num}. EJECUTAR comando: {cmd[:60]}{'...' if len(cmd) > 60 else ''}")
+            i += 1
+            continue
+        i += 1
+    if not actions:
+        return [], text
+    plan_block = "\n\n--- Plan propuesto por ADA (pendiente de tu aprobación) ---\n" + "\n".join(plan_lines) + "\n--- Usa el botón «Ejecutar plan» para aplicar estas acciones o pide cambios en el chat. ---"
+    return actions, text + plan_block
+
+
+def _execute_plan(plan: list) -> Tuple[bool, list]:
+    """Ejecuta una lista de acciones [{type, path, content?, pattern?, command?}]. Devuelve (éxito_global, lista de mensajes)."""
+    results = []
+    all_ok = True
+    for action in plan:
+        t = (action.get("type") or "").strip()
+        if t == "READ_FILE":
+            ok, out = _do_read_file(action.get("path") or "")
+            results.append(f"READ_FILE {action.get('path', '')}: {'OK' if ok else 'ERROR'} — {out[:4000]}")
+            if not ok:
+                all_ok = False
+        elif t == "WRITE_FILE":
+            ok, out = _do_write_file(action.get("path") or "", action.get("content", ""))
+            results.append(f"WRITE_FILE {action.get('path', '')}: {out}")
+            if not ok:
+                all_ok = False
+        elif t == "LIST_DIR":
+            ok, out = _do_list_dir(action.get("path") or ".")
+            results.append(f"LIST_DIR {action.get('path', '.')}: {'OK' if ok else 'ERROR'} — {out[:3000]}" if ok else f"LIST_DIR: {out}")
+            if not ok:
+                all_ok = False
+        elif t == "DELETE_FILE":
+            ok, out = _do_delete_file(action.get("path") or "")
+            results.append(f"DELETE_FILE {action.get('path', '')}: {out}")
+            if not ok:
+                all_ok = False
+        elif t == "DELETE_DIR":
+            ok, out = _do_delete_dir(action.get("path") or "")
+            results.append(f"DELETE_DIR {action.get('path', '')}: {out}")
+            if not ok:
+                all_ok = False
+        elif t == "GREP":
+            ok, out = _do_grep(action.get("pattern") or "", action.get("path_limit"))
+            results.append(f"GREP: {'OK' if ok else 'ERROR'} — {out[:3000]}" if ok else f"GREP: {out}")
+            if not ok:
+                all_ok = False
+        elif t == "RUN_COMMAND":
+            ok, out = _do_run_command(action.get("command") or "")
+            results.append(f"RUN_COMMAND: {'OK' if ok else 'ERROR'} — {out[:3000]}" if ok else f"RUN_COMMAND: {out}")
+            if not ok:
+                all_ok = False
+        else:
+            results.append(f"Acción desconocida: {t}")
+            all_ok = False
+    return all_ok, results
+
+
 def _run_file_tools_in_response(text: str) -> Tuple[str, bool, list]:
     """
-    Si la respuesta de Ollama contiene READ_FILE: o WRITE_FILE:/END_FILE, ejecuta las acciones
-    y devuelve (texto_para_usuario, hubo_herramientas, lista de resultados para inyectar).
+    Si la respuesta de Ollama contiene READ_FILE:, WRITE_FILE:, LIST_DIR:, GREP:, RUN_COMMAND:,
+    ejecuta las acciones y devuelve (texto_para_usuario, hubo_herramientas, lista de resultados).
     """
     results = []
     lines = text.split("\n")
     i = 0
     while i < len(lines):
         line = lines[i]
-        if line.strip().startswith("READ_FILE:"):
+        s = line.strip()
+        s_clean = re.sub(r"^(\d+\.|\-|\*)\s+", "", s)
+        if s_clean.startswith("READ_FILE:"):
             path = line.split("READ_FILE:", 1)[1].strip().strip("'\"")
             if path:
                 ok, out = _do_read_file(path)
@@ -1508,19 +1965,56 @@ def _run_file_tools_in_response(text: str) -> Tuple[str, bool, list]:
                 results.append(res)
             i += 1
             continue
-        if line.strip().startswith("WRITE_FILE:"):
+        if s_clean.startswith("WRITE_FILE:"):
             path = line.split("WRITE_FILE:", 1)[1].strip().strip("'\"")
             i += 1
             content_lines = []
-            while i < len(lines) and lines[i].strip() != "END_FILE":
+            while i < len(lines) and not _is_end_file_line(lines[i]):
                 content_lines.append(lines[i])
                 i += 1
             if i < len(lines):
-                i += 1  # skip END_FILE
+                i += 1
             content = "\n".join(content_lines)
             if path:
                 ok, out = _do_write_file(path, content)
                 results.append(f"WRITE_FILE {path}: {out}")
+            continue
+        if s_clean.startswith("LIST_DIR:"):
+            path = line.split("LIST_DIR:", 1)[1].strip().strip("'\"").strip() or "."
+            ok, out = _do_list_dir(path)
+            results.append(f"LIST_DIR {path}: {'OK' if ok else 'ERROR'} — {out[:3000]}" if ok else f"LIST_DIR {path}: {out}")
+            i += 1
+            continue
+        if s_clean.startswith("DELETE_FILE:"):
+            path = line.split("DELETE_FILE:", 1)[1].strip().strip("'\"")
+            if path:
+                ok, out = _do_delete_file(path)
+                results.append(f"DELETE_FILE {path}: {out}")
+            i += 1
+            continue
+        if s_clean.startswith("DELETE_DIR:"):
+            path = line.split("DELETE_DIR:", 1)[1].strip().strip("'\"")
+            if path:
+                ok, out = _do_delete_dir(path)
+                results.append(f"DELETE_DIR {path}: {out}")
+            i += 1
+            continue
+        if s_clean.startswith("GREP:"):
+            rest = line.split("GREP:", 1)[1].strip().strip("'\"")
+            parts = rest.split(None, 1)
+            pattern = parts[0] if parts else ""
+            path_limit = parts[1].strip() if len(parts) > 1 else None
+            if pattern:
+                ok, out = _do_grep(pattern, path_limit)
+                results.append(f"GREP '{pattern}': {'OK' if ok else 'ERROR'} — {out[:3000]}" if ok else f"GREP: {out}")
+            i += 1
+            continue
+        if s.startswith("RUN_COMMAND:"):
+            cmd = line.split("RUN_COMMAND:", 1)[1].strip().strip("'\"")
+            if cmd:
+                ok, out = _do_run_command(cmd)
+                results.append(f"RUN_COMMAND: {'OK' if ok else 'ERROR'} — {out[:3000]}" if ok else f"RUN_COMMAND: {out}")
+            i += 1
             continue
         i += 1
     if not results:
@@ -1550,6 +2044,23 @@ def autonomous_read_file(path: str = ""):
         return {"status": "ok", "path": path, "content": content}
     except OSError as e:
         return {"status": "error", "detail": f"No se pudo leer: {e}"}
+
+
+@app.post("/execute_plan")
+def execute_plan(body: dict = Body(default={})):
+    """
+    Ejecuta un plan de acciones previamente generado por ADA (READ_FILE, WRITE_FILE, LIST_DIR, etc.).
+    Body: {"plan": [ {"type": "WRITE_FILE", "path": "...", "content": "..."}, ... ]}.
+    Devuelve los resultados de cada acción para que el usuario los vea en el chat.
+    """
+    plan = body.get("plan") or body.get("pending_plan")
+    if not isinstance(plan, list) or len(plan) == 0:
+        return {"status": "error", "detail": "Falta 'plan' (lista de acciones) en el body.", "results": []}
+    try:
+        all_ok, results = _execute_plan(plan)
+        return {"status": "done" if all_ok else "done_with_errors", "results": results}
+    except Exception as e:
+        return {"status": "error", "detail": str(e), "results": []}
 
 
 @app.post("/autonomous/write_file")
@@ -1610,3 +2121,120 @@ def generate_and_propose(req: Optional[GenerateRequest] = None):
         return propose_task(proposal)
     except requests.RequestException as e:
         raise HTTPException(status_code=503, detail=f"Ollama unreachable: {e}")
+
+
+# --- ADA v2 / v2.5 API (goals, ideas, opportunities, conversation, research, self-improvement) ---
+try:
+    from ada_core.memory_manager import MemoryManager
+    from ada_core.conversation_engine import ConversationEngine, ADA_SYSTEM_PROMPT_V2
+    from ada_core.research_engine import research_goal
+    from ada_core.self_improvement_engine import analyze_system_bottlenecks
+    from ada_core.decision_engine import select_best_opportunities
+
+    _v2_memory = MemoryManager()
+    _v2_conversation = ConversationEngine(system_prompt=ADA_SYSTEM_PROMPT_V2)
+
+    @app.get("/v2/goals")
+    def v2_get_goals():
+        """Active goals. Never fails; returns [] if DB unavailable."""
+        return {"goals": _v2_memory.get_active_goals()}
+
+    @app.post("/v2/goals")
+    def v2_add_goal(goal: str = Body(..., embed=True)):
+        """Add a goal. Returns id or 503 if DB unavailable."""
+        gid = _v2_memory.add_goal(goal)
+        if gid is None:
+            raise HTTPException(status_code=503, detail="Memory unavailable")
+        return {"id": gid, "goal": goal, "status": "active"}
+
+    @app.get("/v2/ideas")
+    def v2_get_ideas(goal_id: Optional[int] = None):
+        """Ideas, optionally for one goal. Never fails."""
+        if goal_id is not None:
+            return {"ideas": _v2_memory.get_ideas_for_goal(goal_id)}
+        return {"ideas": []}
+
+    @app.get("/v2/opportunities")
+    def v2_get_opportunities(goal_id: Optional[int] = None, status: str = "pending"):
+        """Opportunities (ideas evaluadas con score). Never fails."""
+        return {"opportunities": _v2_memory.get_opportunities(goal_id=goal_id, status=status)}
+
+    @app.get("/v2/opportunities/top")
+    def v2_get_opportunities_top():
+        """Top scored opportunities (score >= threshold, sorted, top N). Never fails."""
+        return {"opportunities": select_best_opportunities(_v2_memory)}
+
+    @app.get("/v2/goals/derived")
+    def v2_get_derived_goals(parent_goal_id: Optional[int] = None, status: str = "active"):
+        """Dynamically generated (derived) goals. Never fails."""
+        return {"goals": _v2_memory.get_derived_goals(parent_goal_id=parent_goal_id, status=status)}
+
+    @app.get("/v2/plans")
+    def v2_get_plans():
+        """Generated action plans (from best opportunities). Never fails."""
+        return {"plans": _v2_memory.get_plans()}
+
+    @app.get("/v2/experiences")
+    def v2_get_experiences():
+        """Recent experiences (event, result, learning). Never fails."""
+        return {"experiences": _v2_memory.get_recent_experiences()}
+
+    @app.post("/v2/chat")
+    def v2_chat(message: str = Body(..., embed=True), history: Optional[list] = Body(None, embed=True)):
+        """Minimal conversation with ADA v2 prompt. Safe response on failure."""
+        response = _v2_conversation.respond(message or "", history=history)
+        return {"response": response}
+
+    @app.post("/v2/chat/structured")
+    def v2_chat_structured(message: str = Body(..., embed=True), history: Optional[list] = Body(None, embed=True)):
+        """Conversation with structured response (Análisis, Propuesta, Riesgos, Siguiente paso)."""
+        response = _v2_conversation.respond_structured(message or "", history=history)
+        return {"response": response}
+
+    @app.post("/v2/research")
+    def v2_research(goal: str = Body(..., embed=True), context: str = Body("", embed=True)):
+        """Research a goal; returns analysis/strategies (internal, no web)."""
+        return {"analysis": research_goal(goal, context)}
+
+    @app.get("/v2/self-improvement")
+    def v2_self_improvement():
+        """Analyze system bottlenecks and improvement suggestions."""
+        return {"analysis": analyze_system_bottlenecks()}
+
+    # --- ADA v3 API (operational autonomous cognitive agent) ---
+    @app.get("/v3/opportunities/top")
+    def v3_get_opportunities_top():
+        """Top scored opportunities. Never fails."""
+        return {"opportunities": select_best_opportunities(_v2_memory)}
+
+    @app.get("/v3/goals/derived")
+    def v3_get_goals_derived(parent_goal_id: Optional[int] = None, status: str = "active"):
+        """Dynamically generated (derived) goals. Never fails."""
+        return {"goals": _v2_memory.get_derived_goals(parent_goal_id=parent_goal_id, status=status)}
+
+    @app.get("/v3/plans")
+    def v3_get_plans():
+        """Generated action plans (from action_plans table + experiences). Never fails."""
+        action_plans = _v2_memory.get_action_plans(limit=30)
+        if action_plans:
+            return {"plans": action_plans, "from_table": True}
+        return {"plans": _v2_memory.get_plans(), "from_table": False}
+
+    @app.get("/v3/learning")
+    def v3_get_learning():
+        """Recent learnings (experiences with learning/evaluation). Never fails."""
+        return {"learning": _v2_memory.get_learning()}
+
+    @app.post("/v3/chat/structured")
+    def v3_chat_structured(message: str = Body(..., embed=True), history: Optional[list] = Body(None, embed=True)):
+        """Structured response (Analysis, Proposal, Risks, Next Step)."""
+        response = _v2_conversation.respond_structured(message or "", history=history)
+        return {"response": response}
+
+    @app.post("/v3/research")
+    def v3_research(goal: str = Body(..., embed=True), context: str = Body("", embed=True)):
+        """Research a goal; returns analysis/strategies."""
+        return {"analysis": research_goal(goal, context)}
+
+except ImportError:
+    pass

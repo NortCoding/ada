@@ -6,6 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src/ /app/
+COPY ada_core/ /app/ada_core/
 ENV PYTHONPATH=/app
 EXPOSE 3001
 

@@ -83,10 +83,12 @@ ADA/
 1. **Usuario** escribe en Web-Admin o envía un mensaje al bot de Telegram.
 2. **Web-Admin** o **chat-bridge** llama a `POST /chat` de agent-core con `message` y opcionalmente `history`, `use_ollama`, `use_advanced_brain`.
 3. **agent-core**:
-   - Obtiene en paralelo: **memoria** (memory-db: first_plan, weekly_plan, requested_hardware_resources) y **balance** (financial-ledger).
+   - Obtiene en paralelo: **memoria** (memory-db: first_plan, weekly_plan, requested_hardware_resources) y **balance** (financial-ledger). Usa una **caché en memoria** (TTL configurable, ej. 20 s) para no llamar a memory-db/ledger en cada mensaje cuando el contexto no ha cambiado.
    - Construye el **system prompt** (ADA_SYSTEM_PROMPT + contexto de finanzas, fecha, plan, correo de ADA, etc.).
    - Arma la lista de mensajes (system + últimos 4 del historial + mensaje actual).
    - Si `use_advanced_brain` y hay API key de Gemini: llama a **Gemini**; si no, usa **Ollama** (`/api/chat` o `/api/generate`).
+   - Opcionalmente el mensaje puede llevar una **imagen** (`image_base64`): agent-core la envía a Ollama o Gemini para que ADA pueda describirla o responder sobre ella (modelos con visión: ej. `llava`, `llama3.2-vision` en Ollama).
+   - Si está definido `ADA_WORKSPACE`, el prompt incluye instrucciones para usar **READ_FILE** y **WRITE_FILE**: la respuesta de Ollama puede contener líneas `READ_FILE: ruta/archivo` o `WRITE_FILE: ruta` + contenido + `END_FILE`; agent-core ejecuta esas acciones sobre el proyecto (montado en `/workspace`) e inyecta el resultado en la conversación para otra ronda.
    - Devuelve la respuesta; si hubo una **propuesta de tarea** (compra u otra) y la política no la auto-aprueba, devuelve `pending_approval` y en Web-Admin/Telegram el usuario puede Aprobar / Rechazar.
 4. La respuesta se muestra en el chat; las decisiones (aprobar/rechazar) se registran en memory-db y opcionalmente en logging.
 
@@ -141,5 +143,8 @@ Variables necesarias: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` (y en agent-core 
 | Orquestación (chat, plan, ejecutar paso, aprobar) | agent-core (FastAPI, puerto 3001) |
 | Interfaz humana | web-admin (puerto 8080) + opcional chat-bridge (Telegram, 8081) |
 | Ejecución de tareas aprobadas | task-runner (con simulation-engine y policy-engine en modo extended) |
+| Lectura/escritura de archivos del proyecto | agent-core `GET /autonomous/read_file`, `POST /autonomous/write_file` (cuando `ADA_WORKSPACE` está montado, ej. `.:/workspace`) |
+| Caché de contexto de chat | agent-core (memoria + balance en RAM con TTL; variable `ADA_MEMORY_CACHE_TTL_SEC`) |
 
-ADA está construida como un **conjunto de servicios en Docker** con **agent-core** como núcleo que usa **Ollama (y opcionalmente Gemini)** para el razonamiento y **memory-db** (y financial-ledger) para el estado persistente; la autonomía se controla con políticas y con pasos marcados como «humano» cuando no hay automatización (p. ej. Gumroad/Ko-fi). Ver también `docs/AUTONOMIA-ADA.md` y `docs/INICIO-DESDE-CERO.md`.
+ADA está construida como un **conjunto de servicios en Docker** con **agent-core** como núcleo que usa **Ollama (y opcionalmente Gemini)** para el razonamiento y **memory-db** (y financial-ledger) para el estado persistente; la autonomía se controla con políticas y con pasos marcados como «humano» cuando no hay automatización (p. ej. Gumroad/Ko-fi). Ver también `docs/AUTONOMIA-ADA.md`, `docs/INICIO-DESDE-CERO.md` y `docs/MEJORAS-MEMORIA.md`.
+

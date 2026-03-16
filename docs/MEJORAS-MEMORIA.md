@@ -4,6 +4,23 @@ La memoria actual es un almacén clave–valor en PostgreSQL (memory-db → `ada
 
 ---
 
+## 0. **Velocidad y no depender solo de la base de datos**
+
+**Problema:** Cada mensaje de chat pide a memory-db (y al ledger) el contexto (plan, recursos, balance). Si todo va siempre a PostgreSQL, la latencia se nota y ADA depende al 100% de que memory-db responda en cada request.
+
+**Soluciones (de menor a mayor esfuerzo):**
+
+| Enfoque | Qué hace | Ventaja |
+|--------|----------|---------|
+| **Caché en agent-core (implementado)** | El resultado de `get_many` (plan + recursos) y el balance se guardan en memoria en agent-core con TTL (por defecto 20 s). Varios mensajes seguidos o rondas de herramientas reutilizan el mismo contexto sin llamar a memory-db/ledger. Al escribir en memoria (first_plan, weekly_plan, requested_hardware_resources, clear_plan, reset_all) se invalida la caché. | Chat más rápido; menos carga en memory-db y PostgreSQL. Variable opcional: `ADA_MEMORY_CACHE_TTL_SEC` (segundos). |
+| **Caché en memory-db** | Dentro de memory-db, un diccionario en memoria con TTL para las claves más leídas (first_plan, weekly_plan, first_offer). En cada GET/get_many se mira primero la caché; si no está, se lee de PostgreSQL y se guarda en caché. En cada SET se invalida esa clave. | Menos lecturas a PostgreSQL; respuestas más rápidas sin añadir Redis. |
+| **Redis como capa** | Un Redis delante de memory-db: las lecturas van a Redis (muy rápido); si falta, se lee de PostgreSQL y se escribe en Redis. Escrituras: escribir en PostgreSQL e invalidar/actualizar Redis. | Máxima velocidad de lectura y la base de datos solo se usa como persistencia; más componentes que mantener. |
+| **Memoria híbrida (archivos + DB)** | Para datos que cambian poco (plan actual, oferta), mantener una copia en archivos (ej. `data/plan.json`) y leer de ahí en caliente; memory-db/PostgreSQL como fuente de verdad y para el resto de claves. | Menos dependencia de la DB en cada request para ese subconjunto; requiere sincronizar archivo y DB al escribir. |
+
+**Recomendación:** Con la **caché en agent-core** ya activa, el chat debería ir más rápido en conversaciones seguidas. Si más adelante quieres aún menos dependencia de la DB o más velocidad, añadir caché en memory-db o Redis es el siguiente paso.
+
+---
+
 ## 1. **Respaldo e inspección por archivos (recomendado)**
 
 **Problema:** Todo está solo en la base de datos; no hay copia en archivos para backup, revisión o edición manual.
@@ -80,9 +97,11 @@ Si quisieras que parte de la memoria viva **solo en archivos** (sin PostgreSQL p
 
 | Prioridad | Mejora | Esfuerzo |
 |-----------|--------|----------|
+| Alta | **Caché en agent-core** (velocidad, menos dependencia de DB en cada mensaje) | **Hecho:** TTL 20 s, invalidación al escribir plan/recursos |
 | Alta | Export/import a archivos (backup e inspección) | Bajo: script + opcional endpoint |
 | Media | Historial reciente de chat en memoria | Medio: lógica en agent-core + una clave |
-| Media | GET /get_many en memory-db | Bajo |
+| Media | GET /get_many en memory-db | Bajo (ya existe) |
+| Media | Caché en memory-db o Redis para lecturas | Medio |
 | Baja | Convención de prefijos y documentar esquemas | Bajo |
 | Baja | Limpieza de learning_* (y DELETE en memory-db) | Bajo–medio |
 | Opcional | Memoria híbrida archivos + DB para plan/oferta | Medio |
