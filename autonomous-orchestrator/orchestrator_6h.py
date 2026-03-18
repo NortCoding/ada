@@ -17,10 +17,12 @@ MEMORY_URL = os.getenv("MEMORY_URL", "http://memory-db:3005").rstrip("/")
 LOG_URL = os.getenv("LOG_URL", "http://logging-system:3006").rstrip("/")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-MISSION_DURATION_HOURS = float(os.getenv("MISSION_DURATION_HOURS", "6"))
+MISSION_DURATION_HOURS = float(os.getenv("MISSION_DURATION_HOURS", "24"))
 CYCLE_MINUTES = int(os.getenv("CYCLE_MINUTES", "20"))
 NOTIFY_INTERVAL_HOURS = float(os.getenv("NOTIFY_INTERVAL_HOURS", "2"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "60"))
+SPAWN_AGENT_NAME = os.getenv("SPAWN_AGENT_NAME", "ALMA")
+SCORE_THRESHOLD = float(os.getenv("SCORE_THRESHOLD", "0.7"))
 
 # Ideas base de propuestas de ingresos digitales (si no hay Ollama o fallo)
 DEFAULT_PROPOSALS = [
@@ -238,6 +240,26 @@ def build_final_plan(proposals: List[dict], score: dict) -> dict:
     }
 
 
+def _trigger_self_improve_and_spawn(score: dict, cycle_index: int) -> dict:
+    """Si score < threshold: llama /self_improve y /spawn_agent una vez por ciclo."""
+    composite = float((score or {}).get("composite", 0))
+    if composite >= SCORE_THRESHOLD:
+        return {"triggered": False, "reason": "score_ok", "composite": composite}
+    self_resp, self_code = _get("/self_improve?trigger=orchestrator_low_score", base=AGENT_URL)
+    spawn_resp, spawn_code = _get(f"/spawn_agent?agent_name={SPAWN_AGENT_NAME}", base=AGENT_URL)
+    payload = {
+        "triggered": True,
+        "cycle": cycle_index,
+        "composite": composite,
+        "threshold": SCORE_THRESHOLD,
+        "self_improve": {"code": self_code, "resp": self_resp},
+        "spawn_agent": {"code": spawn_code, "resp": spawn_resp},
+    }
+    memory_set("ada_last_low_score_actions", payload)
+    log_event("autonomous-orchestrator", "low_score_actions_triggered", payload)
+    return payload
+
+
 def main():
     duration_sec = MISSION_DURATION_HOURS * 3600
     cycle_sec = CYCLE_MINUTES * 60
@@ -265,9 +287,17 @@ def main():
         memory_set("evolution_score", score)
         log_event("autonomous-orchestrator", "learning_recorded", {"key": "evolution_score", "value": score})
 
+        # Si el score cae por debajo del umbral: auto-mejora + spawn de agente
+        low_score_action = _trigger_self_improve_and_spawn(score, i + 1)
+
         # Notificación cada NOTIFY_INTERVAL_HOURS
         if elapsed_hours - last_notify >= NOTIFY_INTERVAL_HOURS or last_notify == 0:
             notify_progress(i + 1, total_cycles, score, elapsed_hours)
+            if low_score_action.get("triggered"):
+                send_telegram(
+                    f"[A.D.A] score bajo detectado ({score.get('composite', 0):.2f} < {SCORE_THRESHOLD:.2f}). "
+                    f"Se ejecutó /self_improve y /spawn_agent({SPAWN_AGENT_NAME})."
+                )
             last_notify = elapsed_hours
 
         time.sleep(max(1, cycle_sec - (time.time() - start - (i * cycle_sec))))
@@ -290,7 +320,7 @@ def main():
         f"Acción: {final.get('action', '')[:150]}... ROI: {final.get('ROI_estimado')}, Riesgo: {final.get('riesgo')}. "
         f"Revisar en Web-Admin (final_plan_6h)."
     )
-    print("Misión 6h finalizada. Plan en memory-db: final_plan_6h")
+    print("Misión autónoma finalizada. Plan en memory-db: final_plan_6h")
 
 
 if __name__ == "__main__":
