@@ -1,0 +1,83 @@
+.current-file {
+  font-size: 0.8rem;
+  color: var(--accent);
+  background: rgba(59, 130, 246, 0.1);
+  padding: 4px 10px;
+  border-radius: 20px;
+  border: 1px solid rgba(59, 130, 246, 0.2);
+}
+
+.right-content {
+  padding: 1.5rem;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.right-content h3 {
+  font-size: 0.9rem;
+  margin-bottom: 1rem;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-main);
+}
+
+.results-log {
+  background: rgba(0, 0, 0, 0.3);
+  padding: 1rem;
+  border-radius: 8px;
+  font-family: monospace;
+  font-size: 0.8rem;
+  color: #a5d6ff;
+  border: 1px solid var(--border);
+  overflow-x: auto;
+  white-space: pre-wrap;
+}
+
+.empty-state {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+  font-size: 0.85rem;
+  text-align: center;
+  padding: 2rem;
+}
+
+.icon-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+}
+
+.icon-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: white;
+}
+
+.code-header {
+  padding: 8px 12px;
+  background: rgba(255, 255, 255, 0.05);
+  border-bottom: 1px solid var(--border);
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+pre {
+  margin: 0;
+}
+
+code {
+  font-family: 'JetBrains Mono', monospace;
+}

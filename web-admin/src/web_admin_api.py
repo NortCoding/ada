@@ -34,19 +34,30 @@ UI_RUN_ALLOWLIST = [
 ]
 UI_RUN_TIMEOUT = int(os.getenv("ADA_UI_RUN_TIMEOUT", "60"))
 
-FRONTEND_DIST = "/frontend/dist"
+FRONTEND_V1_DIST = "/frontend/v1/dist"
+FRONTEND_LEGACY_DIST = "/frontend/legacy/dist"
 
 
-def _frontend_exists() -> bool:
+def _frontend_v1_exists() -> bool:
     try:
-        return os.path.isfile(os.path.join(FRONTEND_DIST, "index.html"))
+        return os.path.isfile(os.path.join(FRONTEND_V1_DIST, "index.html"))
+    except Exception:
+        return False
+
+def _frontend_legacy_exists() -> bool:
+    try:
+        return os.path.isfile(os.path.join(FRONTEND_LEGACY_DIST, "index.html"))
     except Exception:
         return False
 
 
 # Static assets (React build)
-if os.path.isdir(os.path.join(FRONTEND_DIST, "assets")):
-    app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIST, "assets")), name="assets")
+if os.path.isdir(os.path.join(FRONTEND_V1_DIST, "assets")):
+    app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_V1_DIST, "assets")), name="assets")
+
+# Legacy frontend mount
+if os.path.isdir(FRONTEND_LEGACY_DIST):
+    app.mount("/legacy", StaticFiles(directory=FRONTEND_LEGACY_DIST, html=True), name="legacy")
 
 
 @app.get("/health")
@@ -57,9 +68,9 @@ async def health():
 @app.get("/")
 async def index():
     """Serve SPA index if available; otherwise show API status."""
-    if _frontend_exists():
-        return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
-    return {"status": "ok", "detail": "Frontend not built/mounted. Expected /frontend/dist/index.html"}
+    if _frontend_v1_exists():
+        return FileResponse(os.path.join(FRONTEND_V1_DIST, "index.html"))
+    return {"status": "ok", "ada_v1": True, "detail": "Frontend v1 not built/mounted. Expected /frontend/v1/dist/index.html"}
 
 
 # -----------------------
@@ -99,21 +110,14 @@ async def api_agent_health():
 
 @app.get("/api/agent/status")
 async def api_agent_status():
-    """Best-effort status for the right pane."""
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        r = await client.get(f"{AGENT_URL}/autonomous/capabilities")
-    if r.status_code >= 400:
-        return {"status": "unknown", "detail": "capabilities unavailable"}
-    return r.json()
+    """ADA v1: Dashboard mínimo - chat/files/plans/results."""
+    return {"status": "ok", "ada_v1": True, "features": ["chat", "file_ops", "execute_plan"], "legacy_disabled": True}
 
 
 @app.get("/api/autonomous/plan")
 async def api_autonomous_plan():
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        r = await client.get(f"{AGENT_URL}/autonomous/plan")
-    if r.status_code >= 400:
-        return {"plan": None}
-    return r.json()
+    # Legacy desactivado en ADA v1; no exponer planes de negocio/autonomía por defecto.
+    return {"status": "disabled_v1", "plan": None, "step_statuses": []}
 
 
 @app.post("/api/execute_plan")
@@ -130,29 +134,17 @@ async def api_execute_plan(body: dict):
 
 @app.get("/api/system/monitor")
 async def api_system_monitor():
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        r = await client.get(f"{AGENT_URL}/system/monitor")
-    if r.status_code >= 400:
-        return {"error": "Monitor unavailable", "agents": []}
-    return r.json()
+    return {"status": "disabled_v1", "agents": []}
 
 
 @app.get("/api/agent_market/proposals")
 async def api_agent_market_proposals(status: Optional[str] = None):
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        r = await client.get(f"{AGENT_URL}/agent_market/proposals", params={"status": status} if status else {})
-    if r.status_code >= 400:
-        return {"proposals": []}
-    return r.json()
+    return {"status": "disabled_v1", "proposals": []}
 
 
 @app.post("/api/agent_market/propose")
 async def api_agent_market_propose(body: dict):
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        r = await client.post(f"{AGENT_URL}/agent_market/propose", json=body)
-    if r.status_code >= 400:
-        raise HTTPException(status_code=r.status_code, detail=r.text[:1000])
-    return r.json()
+    raise HTTPException(status_code=410, detail="Agent market desactivado en ADA v1.")
 
 
 # -----------------------
@@ -466,6 +458,14 @@ async def spa_fallback(path: str):
     """SPA fallback: return index.html for non-API routes. Must be registered LAST."""
     if path.startswith("api/") or path in ("health",):
         raise HTTPException(status_code=404, detail="Not found")
-    if _frontend_exists():
-        return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
-    raise HTTPException(status_code=404, detail="Frontend not available")
+    
+    # Legacy fallback
+    if path.startswith("legacy/"):
+        if _frontend_legacy_exists():
+            return FileResponse(os.path.join(FRONTEND_LEGACY_DIST, "index.html"))
+        raise HTTPException(status_code=404, detail="Legacy frontend not available")
+
+    # V1 fallback
+    if _frontend_v1_exists():
+        return FileResponse(os.path.join(FRONTEND_V1_DIST, "index.html"))
+    raise HTTPException(status_code=404, detail="Frontend v1 not available")

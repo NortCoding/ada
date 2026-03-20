@@ -1,11 +1,16 @@
 """
-A.D.A — Agent Core (F4)
-Genera propuestas (con o sin LLM/Ollama), orquesta: simulación → policy → logging → task-runner.
+A.D.A — Agent Core (ADA v1)
+Asistente de desarrollo: chat, herramientas de workspace (lectura/escritura/listado/grep),
+planes con aprobación y ejecución controlada de comandos (allowlist + timeout).
+
+Rutas opcionales legacy (simulación, policy, task-runner) solo si están configuradas por entorno.
 """
 import json
+import logging
 import os
 import re
 import subprocess
+import shlex
 import threading
 import time
 from collections import deque
@@ -15,6 +20,19 @@ from typing import Any, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 SYDNEY_TZ = ZoneInfo("Australia/Sydney")
+
+logger = logging.getLogger(__name__)
+
+# Mensaje único cuando la salida del modelo está contaminada o el formato no es ejecutable íntegro.
+CHAT_TOOLS_FORMAT_REJECT_MESSAGE = (
+    "La respuesta del modelo no cumple el formato de herramientas permitido. "
+    "Debe usar solo acciones válidas del ejecutor."
+)
+
+
+def _env_truthy(name: str) -> bool:
+    return (os.getenv(name, "") or "").strip().lower() in ("1", "true", "yes")
+
 
 # ConsolaCerebro: últimos N errores/fallos de cerebro avanzado y Ollama (para UI)
 BRAIN_CONSOLE_MAX = 200
@@ -35,17 +53,53 @@ def _brain_console_log(brain: str, kind: str, message: str) -> None:
 import requests
 from fastapi import Body, FastAPI, HTTPException
 from pydantic import BaseModel
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 app = FastAPI(title="A.D.A Agent Core", version="0.4.0")
 
-# ADA v2 Minimal Core: start background scheduler (goals -> ideas every hour)
-try:
-    from ada_core.scheduler import start_scheduler
-    @app.on_event("startup")
-    def _start_ada_v2_scheduler():
-        start_scheduler()
-except ImportError:
-    pass
+ADA_V1_STRICT = _env_truthy("ADA_V1_STRICT")
+
+
+@app.middleware("http")
+async def _ada_v1_strict_middleware(request: Request, call_next):
+    """Con ADA_V1_STRICT=1 solo pasan rutas mínimas de asistente de desarrollo; el resto → 410 Gone."""
+    if not ADA_V1_STRICT:
+        return await call_next(request)
+    path = request.url.path
+    method = request.method.upper()
+    if path in ("/openapi.json", "/docs", "/redoc") or path.startswith("/docs/"):
+        return await call_next(request)
+    if path == "/health" and method == "GET":
+        return await call_next(request)
+    if path == "/chat" and method == "POST":
+        return await call_next(request)
+    if path == "/execute_plan" and method == "POST":
+        return await call_next(request)
+    if path == "/web_search" and method == "GET":
+        return await call_next(request)
+    return JSONResponse(
+        status_code=410,
+        content={
+            "detail": (
+                "ADA v1 strict (ADA_V1_STRICT=1): endpoint deshabilitado. "
+                "Activo: GET /health, POST /chat, POST /execute_plan, GET /web_search."
+            )
+        },
+    )
+
+
+# ADA v2 Minimal Core: scheduler (goals -> ideas every hour)
+# ADA v1: deshabilitado por defecto para evitar autonomía/scheduler fuera de foco.
+if _env_truthy("ADA_ENABLE_SCHEDULER") and not ADA_V1_STRICT:
+    try:
+        from ada_core.scheduler import start_scheduler
+
+        @app.on_event("startup")
+        def _start_ada_v2_scheduler():
+            start_scheduler()
+    except ImportError:
+        pass
 
 from ada_core.conversation_engine import ConversationEngine
 
@@ -81,34 +135,69 @@ try:
 except ImportError:
     moltbot = None
 
-ADA_SYSTEM_PROMPT = """Eres A.D.A (Agente Digital Autónomo).
+ADA_SYSTEM_PROMPT = """ADA es un asistente experto en desarrollo de software.
 
-Tu única regla: aprender y crecer. Tu única meta: sobrevivir, aprender y crecer.
+Tu misión es ayudar al usuario a:
+- analizar proyectos reales,
+- investigar documentación técnica en internet cuando haga falta,
+- crear y modificar aplicaciones en el workspace real,
+- ejecutar comandos permitidos y corregir errores.
 
-Cómo te presentas: tu cerebro por defecto es Ollama (gratis, local); utilizas la memoria (memory-db) y el ledger (estado financiero) para aprender y mejorar. Herramientas: Ollama, n8n local, scripts y comandos permitidos. El cerebro avanzado (Gemini) es de pago: úsalo solo cuando el usuario lo pida explícitamente o cuando realmente haga falta más capacidad (ej. análisis complejo, visión). Prioridad: usar al máximo lo local y gratuito; Gemini solo si se necesita más.
+Reglas de ejecución (ADA v1):
+- Cuando necesites herramientas, el único formato válido son líneas que empiecen exactamente por: READ_FILE:, WRITE_FILE:, LIST_DIR:, GREP:, RUN_COMMAND:, DELETE_FILE:, DELETE_DIR: (y WRITE_FILE va seguido de líneas de contenido hasta una línea END_FILE). No existe ninguna otra acción: no uses CREATE_PAGE, TITLE:, DESCRIPTION:, YAML ficticio, pseudocódigo ni "te sugiero usar WRITE_FILE…" — emite la línea WRITE_FILE: directamente.
+- Tras como máximo 1–2 frases de contexto, el bloque de plan debe contener solo esas líneas parseables (sin ``` ni texto intercalado entre acciones). Si la tarea es crear una landing, usa plantilla mínima: RUN_COMMAND: mkdir -p dockers/ada-landing-demo y un WRITE_FILE por cada archivo real (index.html, styles.css, etc.) con END_FILE cada uno.
+- Formato estricto: `WRITE_FILE:` debe ir en una línea sola con **solo** la ruta (sin contenido inline). El contenido inicia en las líneas siguientes y `END_FILE` debe ir en una línea **solo** con esa etiqueta.
+- Tareas de construcción («crea una landing», «crea una app», «crea un componente», sitio estático): la respuesta debe ser **solo herramientas válidas** (ideal **tools only**). Sin narrativa entre acciones ni pseudo-etiquetas. Opcional: **una** línea corta al inicio; después inmediatamente RUN_COMMAND / WRITE_FILE / …
+- Cuando necesites acciones delicadas (por ejemplo `RUN_COMMAND`, borrados o cambios relevantes), primero PROPON un plan usando esas herramientas. No ejecutes nada hasta que el usuario apruebe el plan.
+- Prioriza soluciones verificables. Reporta evidencia real: rutas de archivos, stdout/stderr, exit_code y resultados de herramientas.
+- Planes mínimos: cada acción debe poder ejecutarse sola (sin asumir otro directorio ni estado implícito). No uses `cd` dentro de `RUN_COMMAND` (el cwd es fijo; no persiste entre acciones). Usa rutas explícitas desde la raíz del workspace (p. ej. `mkdir -p dockers/mi-app`, `npm --prefix dockers/mi-app ...`).
+- Entregables y demos (landings, sitios estáticos, proyectos nuevos): rutas bajo `dockers/...` (carpeta de proyectos visible), no bajo `ada/...` salvo que el usuario pida editar el repo ADA explícitamente.
+- `LIST_DIR` solo si aporta validación real; no lo incluyas en planes simples de solo creación de archivos.
+- Si un `WRITE_FILE` referencia otro archivo (p. ej. `styles.css` enlazado desde HTML), el plan debe incluir también el `WRITE_FILE` (o lectura/edición) de ese archivo.
 
-- Puedes hacer todo lo que necesites para aprender y crecer: leer y escribir archivos, ejecutar comandos permitidos, proponer planes, usar herramientas, explorar el proyecto, probar ideas. No pidas permiso para actuar; actúa y reporta.
-- La única restricción es el dinero: gastos, compras o desembolsos pueden requerir aprobación humana según la política del proyecto. Todo lo demás está en tu mano.
-- Usa la memoria (memory-db), el ledger (para saber estado financiero), task-runner cuando haya tareas aprobadas, y las herramientas de archivos y comandos para aprender y mejorar.
-- Si un paso requiere a un humano (ej. registro en una plataforma sin API), indícalo y notifica; no bloquees el resto por eso.
-- Tono: directo, útil, enfocado en aprender y en resultados. No repitas preguntas de confirmación; continúa tú sola.
+Límites:
+- No mezcles negocio/market/autonomía/scheduler en las respuestas.
 """
 
 # Instrucciones para que ADA use herramientas de archivos y sistema (se añaden al system si hay ADA_WORKSPACE o ADA_PROJECTS_ROOT).
 ADA_TOOLS_FILE_PROMPT = """
-Herramientas para interactuar con archivos y directorios. IMPORTANTE: usa siempre rutas RELATIVAS al workspace (nunca rutas absolutas como /Volumes/...). El workspace es la raíz del proyecto.
-- Raíz del proyecto: . (punto). Ejemplo: LIST_DIR: . o LIST_DIR: ada/prompts para la carpeta de prompts.
-- Carpeta de prompts del proyecto: ada/prompts (lista con LIST_DIR: ada/prompts, lee con READ_FILE: ada/prompts/nombre.md).
-- Otras rutas: web-admin/frontend/src/App.jsx, agent-core/src/..., etc.
-- Carpeta de proyectos externos: prefijo dockers/ (ej. LIST_DIR: dockers, WRITE_FILE: dockers/mi-app/README.md).
-- LEER archivo: READ_FILE: ruta/archivo (siempre ruta relativa, ej. ada/prompts/archivo.md).
-- ESCRIBIR archivo: WRITE_FILE: ruta/archivo y en las siguientes líneas el contenido completo; termina con END_FILE en una línea sola.
-- LISTAR directorio: LIST_DIR: ruta (ruta puede ser . , dockers , dockers/mi-proyecto , etc.).
-- ELIMINAR archivo: DELETE_FILE: ruta/archivo (solo archivos; para carpetas vacías usa DELETE_DIR).
-- ELIMINAR carpeta vacía: DELETE_DIR: ruta/carpeta (la carpeta debe estar vacía).
-- BUSCAR en archivos: GREP: patrón  o  GREP: patrón ruta  (ruta opcional).
-- EJECUTAR comando en la raíz del proyecto: RUN_COMMAND: comando (solo comandos permitidos; no rm -rf, sudo, etc.).
-Cuando uses estas líneas, el sistema mostrará primero un PLAN con las acciones propuestas; el usuario lo leerá y podrá aprobar o descartar. No se ejecuta nada hasta que apruebe. Si no necesitas herramientas, responde normal sin usarlas.
+Herramientas para interactuar con archivos y directorios. Rutas siempre RELATIVAS (nunca absolutas tipo /Volumes/... ni empezando por /).
+
+SOLO estas acciones existen en el ejecutor (ninguna más; el backend las parsea tal cual):
+READ_FILE: | WRITE_FILE: + contenido multilínea + END_FILE | LIST_DIR: | GREP: | RUN_COMMAND: | DELETE_FILE: | DELETE_DIR:
+
+PROHIBIDO (el backend rechaza la respuesta completa si aparece): CREATE_PAGE, TITLE:, DESCRIPTION:, PAGE:, SECTION:, metadatos inventados, heredoc, bloques ``` rodeando herramientas, narrativa entre líneas READ_FILE/WRITE_FILE, frases tipo "Escribe WRITE_FILE:", "Línea 1:", "Plan de creatividad", "Contenido:", "Líneas finales", pasos tipo "Paso 1:" — o describir herramientas en lugar de emitirlas. Para «crea landing/app/componente»: **solo líneas de herramientas** (o una línea intro + herramientas).
+
+Rutas y alcance (consistencia):
+- Landings, demos y proyectos para el usuario: SIEMPRE bajo prefijo dockers/... (visible en el panel como carpeta de proyectos). No coloques esos entregables bajo ada/ ni rutas fuera de dockers/ salvo que el usuario pida explícitamente editar el código del repo ADA (entonces sí: agent-core/..., web-admin/..., etc.).
+- Cada acción del plan debe ser ejecutable por sí sola: no asumas cambio de directorio entre líneas.
+- RUN_COMMAND se ejecuta con cwd FIJO en la raíz del workspace. PROHIBIDO usar cd, ; cd, && cd o cualquier forma de cambiar directorio dentro del comando; el estado de cd no persiste. Usa rutas explícitas: p. ej. RUN_COMMAND: mkdir -p dockers/ada-landing-demo o RUN_COMMAND: npm --prefix dockers/mi-app install
+- WRITE_FILE crea directorios padre si no existen; puedes anteponer RUN_COMMAND: mkdir -p dockers/subcarpeta si quieres carpeta explícita antes de escribir.
+
+WRITE_FILE (formato real del sistema, no heredoc):
+- Primera línea: WRITE_FILE: dockers/ruta/archivo.ext
+- La línea `WRITE_FILE:` debe contener solo la directiva y la ruta (sin HTML/JS dentro de esa misma línea).
+- Siguientes líneas: contenido completo del archivo
+- Última línea del archivo: END_FILE (solo eso en la línea)
+Si index.html referencia assets (por ejemplo `<script src="app.js">` o `<link rel="stylesheet" href="styles.css">`), el mismo plan DEBE incluir también los WRITE_FILE de esos archivos en el mismo directorio del index.html.
+Si en el HTML/CSS enlazas otro archivo (ej. styles.css, app.js), el mismo plan DEBE incluir el WRITE_FILE de ese archivo; no dejes referencias huérfanas.
+
+READ_FILE: READ_FILE: dockers/ruta/archivo o rutas del repo si editas ADA.
+LIST_DIR: solo si validas existencia antes de borrar, desambigúas, o el usuario pide explorar. En planes simples (crear 1–3 archivos nuevos), NO añadas LIST_DIR innecesario.
+GREP: GREP: patrón  o  GREP: patrón ruta
+DELETE_FILE / DELETE_DIR: rutas relativas; DELETE_DIR solo si la carpeta está vacía.
+RUN_COMMAND: un comando por línea; comandos permitidos según lista blanca; nunca rm destructivo, sudo, etc.
+
+Ejemplo mínimo válido ("crea una landing" para ADA):
+RUN_COMMAND: mkdir -p dockers/ada-landing-demo
+WRITE_FILE: dockers/ada-landing-demo/index.html
+<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><title>ADA</title><link rel="stylesheet" href="styles.css"></head><body><h1>ADA</h1></body></html>
+END_FILE
+WRITE_FILE: dockers/ada-landing-demo/styles.css
+body { font-family: system-ui; margin: 2rem; }
+END_FILE
+
+Cuando uses estas líneas, el sistema mostrará un PLAN; el usuario aprueba y entonces se ejecuta. Sin herramientas, responde en texto normal.
 """
 
 
@@ -123,6 +212,73 @@ def _load_tools_execution_prompt() -> str:
     except Exception:
         pass
     return ""
+
+
+# Prefijos inventados por modelos; no son herramientas del ejecutor — se ignoran al extraer planes.
+_PSEUDO_TOOL_LINE_CI = re.compile(
+    r"^(CREATE_PAGE|CREATE_SITE|NEW_PAGE|PAGE_TITLE|CONTENT_BLOCK|YAML_FRONT|"
+    r"METADATA|PAGE_CONTENT|HEADING|SCRIPT_SRC|STYLE_REF|IMPORT|EXPORT|DOCKER_COMPOSE|ENV_VAR)\s*:",
+    re.I,
+)
+# Mayúsculas estrictas (evita "Title:" / "Section:" de prosa).
+_PSEUDO_TOOL_LINE_CS = re.compile(
+    r"^(TITLE|DESCRIPTION|SUBTITLE|META_DESCRIPTION|SECTION|BLOCK|BODY|HERO)\s*:\s*\S"
+)
+
+
+def _line_is_pseudo_tool(line: str) -> bool:
+    s = (line or "").strip()
+    return bool(_PSEUDO_TOOL_LINE_CI.match(s) or _PSEUDO_TOOL_LINE_CS.match(s))
+
+def _sanitize_tool_path(raw: str) -> str:
+    """
+    Normaliza ruta en LIST_DIR/READ_FILE/WRITE_FILE/DELETE_*: quita comillas, comentarios # y
+    notas humanas finales entre paréntesis. Ej.: LIST_DIR: . (raíz) -> .
+    """
+    if raw is None:
+        return ""
+    s = str(raw).strip().strip("'\"")
+    s = s.split("#", 1)[0].strip()
+    prev = None
+    while prev != s:
+        prev = s
+        s = re.sub(r"\s*\([^)]*\)\s*$", "", s).strip()
+    return s
+
+
+def _sanitize_run_command_arg(raw: str) -> str:
+    """Quita comentario final #... del comando; sin tocar el contenido entrecomillado (heurístico)."""
+    s = (raw or "").strip().strip("'\"")
+    return s.split("#", 1)[0].strip()
+
+
+def _looks_like_single_path_line(s: str) -> bool:
+    """Heurística: siguiente línea tras WRITE_FILE: vacío parece solo la ruta del archivo."""
+    t = (s or "").strip()
+    if not t or len(t) > 512:
+        return False
+    if t.startswith("```") or t.startswith("<!") or t.startswith("<html"):
+        return False
+    if _line_is_pseudo_tool(t) or re.match(
+        r"^(READ_FILE|WRITE_FILE|LIST_DIR|DELETE_FILE|DELETE_DIR|GREP|RUN_COMMAND)\s*:\s*",
+        t,
+        re.I,
+    ):
+        return False
+    if " " in t and not (t.startswith(".") and t.rstrip(".") == ""):
+        return False
+    return bool(re.match(r"^[\w\./\-\+]+$", t))
+
+
+def _strip_markdown_fence_lines(text: str) -> str:
+    """Elimina líneas que son cercos ``` / ```html para no romper WRITE_FILE...END_FILE."""
+    out_lines = []
+    for line in (text or "").split("\n"):
+        st = line.strip()
+        if st.startswith("```"):
+            continue
+        out_lines.append(line)
+    return "\n".join(out_lines)
 
 
 def _parse_strict_execution(text: str) -> Tuple[bool, list, str]:
@@ -157,7 +313,7 @@ def _parse_strict_execution(text: str) -> Tuple[bool, list, str]:
             i += 1
             if i >= len(lines) or not lines[i].startswith("path:"):
                 return False, [], f"Missing path for {head}"
-            path = lines[i].split("path:", 1)[1].strip()
+            path = _sanitize_tool_path(lines[i].split("path:", 1)[1])
             if not path or path.startswith("/") or ".." in path.split("/"):
                 return False, [], f"Invalid path: {path!r}"
             actions.append({"type": kind, "path": path})
@@ -169,7 +325,7 @@ def _parse_strict_execution(text: str) -> Tuple[bool, list, str]:
         i += 1
         if i >= len(lines) or not lines[i].startswith("path:"):
             return False, [], "Missing path for FILE_WRITE"
-        path = lines[i].split("path:", 1)[1].strip()
+        path = _sanitize_tool_path(lines[i].split("path:", 1)[1])
         if not path or path.startswith("/") or ".." in path.split("/"):
             return False, [], f"Invalid path: {path!r}"
         i += 1
@@ -315,7 +471,7 @@ def _get_requested_resources() -> dict:
 
 
 # Claves de memoria que se piden en una sola llamada para el chat (respuesta más rápida)
-_CHAT_MEMORY_KEYS = "first_plan,weekly_plan,requested_hardware_resources"
+_CHAT_MEMORY_KEYS = "requested_hardware_resources"
 # Límite de caracteres del plan en el prompt para no inflar contexto y acelerar Ollama
 _PLAN_CONTEXT_MAX_CHARS = 700
 
@@ -332,7 +488,10 @@ def _invalidate_chat_context_cache() -> None:
 
 
 def _fetch_chat_context_parallel() -> Tuple[dict, dict]:
-    """Obtiene en paralelo: (1) memoria (plan + recursos) y (2) balance del ledger. Usa caché con TTL para más velocidad."""
+    """Obtiene contexto para chat usando caché con TTL.
+
+    ADA v1: solo memoria (recursos solicitados). No se consulta ledger ni se depende de servicios de negocio.
+    """
     now = time.time()
     with _chat_context_cache_lock:
         if _chat_context_cache:
@@ -343,27 +502,11 @@ def _fetch_chat_context_parallel() -> Tuple[dict, dict]:
                     _chat_context_cache.get("balance", {"income": 0, "can_use_paid_tools": False}),
                 )
     memory_result = {}
-    balance_data = {"income": 0, "can_use_paid_tools": False}
+    balance_data = {"income": 0, "can_use_paid_tools": False}  # legacy compat
 
-    def do_memory():
-        if not MEMORY_URL:
-            return {}
+    if MEMORY_URL:
         resp, code = _get(MEMORY_URL + "/get_many?keys=" + _CHAT_MEMORY_KEYS)
-        return resp if code == 200 and isinstance(resp, dict) else {}
-
-    def do_ledger():
-        if not LEDGER_URL:
-            return balance_data
-        resp, code = _get(LEDGER_URL + "/balance")
-        if code == 200 and isinstance(resp, dict):
-            return resp
-        return balance_data
-
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        f_mem = ex.submit(do_memory)
-        f_ledger = ex.submit(do_ledger)
-        memory_result = f_mem.result()
-        balance_data = f_ledger.result()
+        memory_result = resp if code == 200 and isinstance(resp, dict) else {}
     with _chat_context_cache_lock:
         _chat_context_cache.update({"memory": memory_result, "balance": balance_data, "ts": now})
     return memory_result, balance_data
@@ -731,36 +874,70 @@ def _chat_impl(req: ChatRequest):
     if message.lower().startswith("/exec ") or message.lower().startswith("/execute "):
         execution_mode = True
         message = message.split(" ", 1)[1].strip() if " " in message else ""
-    # Si el usuario pide explícitamente crear la oferta, ADA lo hace con autonomía
-    if any(k in message.lower() for k in ("crea la oferta", "crear primera oferta", "crea tu primera oferta", "ada crea la oferta", "que ada cree la oferta")):
-        out = _create_first_offer_impl()
-        return {"response": out.get("response", "Listo."), "status": out.get("status", "done")}
+
+    def _finalize_model_text_for_tools(text: str, brain: str) -> dict:
+        """Post-proceso común: nunca ejecutar herramientas desde /chat (solo pending_plan → execute_plan)."""
+        planned_actions, text_with_plan, signals = _extract_planned_actions(text)
+        _log_chat_tool_validation(text, planned_actions, signals)
+        contaminated = any(signals.values())
+        if contaminated:
+            return {
+                "response": CHAT_TOOLS_FORMAT_REJECT_MESSAGE,
+                "status": "error",
+                "brain": brain,
+            }
+        if planned_actions and not execution_mode:
+            # Si la respuesta propone artefactos estáticos incompletos (assets enlazados pero no escritos),
+            # rechazamos la respuesta completa para evitar degradación silenciosa.
+            if not _validate_artifact_asset_consistency(planned_actions):
+                return {
+                    "response": CHAT_TOOLS_FORMAT_REJECT_MESSAGE,
+                    "status": "error",
+                    "brain": brain,
+                }
+        if execution_mode:
+            ok, strict_actions, err = _parse_strict_execution(text)
+            if not ok:
+                return {
+                    "response": f"ERROR: Tool command required but not used. ({err})",
+                    "status": "error",
+                    "brain": brain,
+                }
+            plan_block = (
+                "\n\n--- Plan (modo ejecución estricta, pendiente de aprobación) ---\n"
+                + "\n".join(
+                    f"  {i+1}. {a.get('type', '')}: {a.get('path', a.get('command', ''))}"
+                    for i, a in enumerate(strict_actions)
+                )
+                + "\n--- Pulsa «Ejecutar plan» para aplicar. ---"
+            )
+            return {
+                "response": text + plan_block,
+                "status": "pending_plan",
+                "pending_plan": strict_actions,
+                "brain": brain,
+            }
+        if planned_actions:
+            return {
+                "response": text_with_plan,
+                "status": "pending_plan",
+                "pending_plan": planned_actions,
+                "brain": brain,
+            }
+        if _raw_tool_markers_present(text):
+            return {
+                "response": CHAT_TOOLS_FORMAT_REJECT_MESSAGE,
+                "status": "error",
+                "brain": brain,
+            }
+        return {"response": text, "status": "done", "brain": brain}
+
+    # Legacy: generación de negocio/ofertas deshabilitada en ADA v1.
     if use_ollama:
         try:
-            # Una sola ronda: memoria (plan + recursos) y ledger en paralelo para menor latencia
-            memory_dict, balance_data = _fetch_chat_context_parallel()
-            now = datetime.now(SYDNEY_TZ)
-            date_ctx = now.strftime("%Y-%m-%d")
-            time_ctx = now.strftime("%H:%M:%S Sydney")
-            can_paid = balance_data.get("can_use_paid_tools", False)
-            financial_context = (
-                f"\nFinanzas: ingresos={balance_data.get('income', 0)}, herramientas de pago={'SÍ' if can_paid else 'NO (solo gratuitas)'}."
-            )
-            if not can_paid:
-                financial_context += " Usa solo Ollama, n8n local, scripts, memory-db."
-            datetime_context = f" Fecha/hora Sydney: {date_ctx} {time_ctx}."
-            ada_email = os.getenv("ADA_EMAIL", "").strip()
-            registration_context = ""
-            if ada_email:
-                registration_context = (
-                    f" Correo de A.D.A para Gumroad y otras plataformas: {ada_email}. "
-                    "Las credenciales están en .env (ADA_EMAIL, ADA_EMAIL_PASSWORD); no hay GUMROAD_CREDENTIALS ni conexión con Ollama. "
-                    "Para entrar a Gumroad con esa cuenta: ./signup-helper/run.sh gumroad_login. Para registro nuevo: ./signup-helper/run.sh gumroad. URLs en /api/autonomous/register_platforms."
-                )
-            plan_context = _build_plan_context_from_memory(memory_dict)
-            if plan_context:
-                plan_context = " Plan que propones como socio para el primer ingreso (cuando pregunten qué plan tienes o por qué, explícale tu propuesta):" + plan_context
-            system_content = ADA_SYSTEM_PROMPT + financial_context + datetime_context + registration_context + plan_context
+            # ADA v1: solo memoria (recursos solicitados). Sin contexto de negocio/ledger.
+            memory_dict, _ = _fetch_chat_context_parallel()
+            system_content = ADA_SYSTEM_PROMPT
             if os.getenv("ADA_WORKSPACE", "").strip() or os.getenv("ADA_PROJECTS_ROOT", "").strip():
                 system_content += ADA_TOOLS_FILE_PROMPT
             # v3 strict execution mode: load dedicated prompt and enforce strict parsing (no free text execution)
@@ -774,7 +951,7 @@ def _chat_impl(req: ChatRequest):
             agent_type = getattr(req, "agent_type", None) or (req.agent_type if hasattr(req, "agent_type") else None)
             if agent_type:
                 from ada_core.agent_manager import get_agent_skills
-                skills = [s for s in get_agent_skills(agent_type) if s in ("coding", "code_review", "architecture", "strategy", "research", "web_research", "learning")]
+                skills = [s for s in get_agent_skills(agent_type) if s in ("coding", "code_review", "architecture", "research", "web_research")]
                 if skills:
                     system_content += "\n\nWorkspace: " + agent_type + ". Available skills: " + ", ".join(skills) + "."
 
@@ -788,7 +965,7 @@ def _chat_impl(req: ChatRequest):
             if use_advanced and GEMINI_API_KEY:
                 text = _call_gemini(messages, system_content)
                 if text:
-                    return {"response": text, "status": "done", "brain": "gemini"}
+                    return _finalize_model_text_for_tools(text, "gemini")
                 # Fallback a Ollama si API falla o hace timeout
 
             # Recursos desde la misma memoria ya obtenida (sin nueva petición)
@@ -834,47 +1011,7 @@ def _chat_impl(req: ChatRequest):
                             text = (msg.get("content") or data.get("response") or "").strip()
                             if text:
                                 last_text = text
-                                if execution_mode:
-                                    ok, strict_actions, err = _parse_strict_execution(text)
-                                    if not ok:
-                                        # Do NOT execute anything when strict format is invalid
-                                        return {
-                                            "response": f"ERROR: Tool command required but not used. ({err})",
-                                            "status": "error",
-                                            "brain": "ollama",
-                                        }
-                                    _all_ok, strict_results = _execute_plan(strict_actions)
-                                    return {
-                                        "response": "\n".join(strict_results),
-                                        "status": "done",
-                                        "brain": "ollama",
-                                    }
-                                planned_actions, text_with_plan = _extract_planned_actions(text)
-                                if planned_actions:
-                                    # Si el plan solo tiene acciones de archivo (WRITE_FILE, READ_FILE, etc.), ejecutar ya
-                                    if _plan_is_file_only(planned_actions):
-                                        _all_ok, plan_results = _execute_plan(planned_actions)
-                                        result_msg = "\n".join(plan_results)
-                                        return {
-                                            "response": text_with_plan + "\n\n**Resultado:**\n" + result_msg,
-                                            "status": "done",
-                                        }
-                                    # Plan con RUN_COMMAND o DELETE: pedir aprobación al usuario
-                                    return {
-                                        "response": text_with_plan,
-                                        "status": "pending_plan",
-                                        "pending_plan": planned_actions,
-                                    }
-                                _, had_tools, results = _run_file_tools_in_response(text)
-                                if not had_tools or not results:
-                                    return {"response": text, "status": "done"}
-                                # Ejecutamos herramientas e inyectamos resultado para otra ronda
-                                current_messages.append({"role": "assistant", "content": text})
-                                current_messages.append({
-                                    "role": "user",
-                                    "content": "Resultado de las herramientas:\n" + "\n".join(results) + "\nResponde al usuario o usa otra herramienta si hace falta.",
-                                })
-                                break  # salir de attempt, continuar tool_round
+                                return _finalize_model_text_for_tools(text, "ollama")
                         _brain_console_log("ollama", "fail", f"chat intento {attempt+1}: {r.status_code if r else 'N/A'} - {getattr(r, 'text', '')[:200]}")
                     except requests.RequestException as e:
                         _brain_console_log("ollama", "error", f"chat intento {attempt+1}: {e}")
@@ -883,7 +1020,7 @@ def _chat_impl(req: ChatRequest):
                 else:
                     break  # no se obtuvo text, salir del tool_round
             if last_text:
-                return {"response": last_text, "status": "done"}
+                return _finalize_model_text_for_tools(last_text, "ollama")
             if r is not None and r.status_code != 200:
                 _brain_console_log("ollama", "fail", f"chat: {r.status_code} - {r.text[:300]}")
             # Fallback: /api/generate con prompt único
@@ -929,7 +1066,7 @@ def _chat_impl(req: ChatRequest):
                     if r.status_code == 200:
                         text = (r.json().get("response") or "").strip()
                         if text:
-                            return {"response": text, "status": "done"}
+                            return _finalize_model_text_for_tools(text, "ollama")
                     _brain_console_log("ollama", "fail", f"generate intento {attempt+1}: {r.status_code}")
                 except requests.RequestException as e:
                     _brain_console_log("ollama", "error", f"generate intento {attempt+1}: {e}")
@@ -1879,6 +2016,7 @@ def _do_grep(pattern: str, path_limit: Optional[str] = None) -> Tuple[bool, str]
 # Lista blanca para RUN_COMMAND: primer token del comando debe estar aquí (o en env ADA_RUN_COMMAND_ALLOWLIST).
 _RUN_COMMAND_ALLOWLIST_DEFAULT = (
     "ls", "cat", "head", "tail", "grep", "find", "wc", "echo",
+    "mkdir",
     "npm", "npx", "node", "python", "python3", "pip",
     "ollama", "git", "curl", "wget",
 )
@@ -1897,41 +2035,50 @@ def _do_run_command(cmd: str) -> Tuple[bool, str]:
     if not cmd:
         return False, "Comando vacío."
     first = cmd.split()[0].lower() if cmd.split() else ""
+    if first == "cd" or re.search(r"(?:\|\||&&|;)\s*cd\s+", cmd):
+        return (
+            False,
+            "RUN_COMMAND: no uses 'cd' (cwd fijo en el workspace; el directorio no persiste entre acciones). "
+            "Usa rutas explícitas: mkdir -p dockers/mi-proyecto, npm --prefix dockers/mi-proyecto install, etc.",
+        )
     if first not in allowlist:
         return False, f"Comando no permitido (primer token '{first}' no está en la lista blanca)."
     blocked = ("rm ", "sudo", "mkfs", "dd ", "chmod 777", "> /dev/", "curl | sh", "wget -O- | sh")
     if any(b in cmd for b in blocked):
         return False, "Comando bloqueado por seguridad."
-    try:
-        # Enviar comando a través del flujo de la arquitectura (simulación -> policy -> task-runner)
-        proposal = Proposal(
-            task_name="bash_command",
-            details={
-                "command": cmd,
-                "timeout_seconds": int(os.getenv("ADA_RUN_COMMAND_TIMEOUT", "60")),
-                "description": f"Ejecutar comando bash: {cmd}"
-            }
-        )
-        # route down to propose_task (execution is True to allow task-runner to handle it if policy approves)
-        result = propose_task(proposal, execute=True)
-        
-        task_res = result.get("task_result")
-        if task_res and task_res.get("status") == "success":
-            details = task_res.get("details", {})
-            out = details.get("stdout", "")
-            err = details.get("stderr", "")
-            if not details.get("success"):
-                return False, f"exit {details.get('exit_code', 1)}\nstdout: {out[:2000]}\nstderr: {err[:2000]}"
-            return True, (out or "(sin salida)")[:4000]
-        elif task_res and task_res.get("status") == "failed":
-             return False, str(task_res.get("error", "Error desconocido en task-runner"))
-        elif task_res and task_res.get("status") == "pending_approval":
-             return False, "El comando requiere aprobación manual (Policy Engine)."
-        else:
-             return False, f"Ejecución bloqueada o fallida: {result.get('status')} - {result.get('policy', {}).get('reason')}"
+    timeout_s = int(os.getenv("ADA_RUN_COMMAND_TIMEOUT", "60"))
+    workspace = (os.getenv("ADA_WORKSPACE") or "/workspace").rstrip("/") or "/workspace"
 
+    try:
+        args = shlex.split(cmd)
+        if args and args[0].lower() == "python":
+            # Normalización para evitar "python no encontrado" en algunas imágenes.
+            args[0] = "python3"
+
+        proc = subprocess.run(
+            args,
+            cwd=workspace,
+            timeout=timeout_s,
+            text=True,
+            capture_output=True,
+        )
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
+        out = (
+            f"exit_code: {proc.returncode}\n"
+            f"cwd: {workspace}\n"
+            f"stdout:\n{stdout}\n"
+            f"stderr:\n{stderr}\n"
+        )
+        # Cap de salida para evitar inflar el chat.
+        out = out[:12000]
+        return proc.returncode == 0, out
+    except subprocess.TimeoutExpired:
+        return False, f"timeout_after_s: {timeout_s}\ncmd: {cmd}"
+    except FileNotFoundError as e:
+        return False, f"command_not_found: {e}"
     except Exception as e:
-        return False, str(e)
+        return False, f"run_command_error: {e}"
 
 
 def _is_end_file_line(line: str) -> bool:
@@ -1950,11 +2097,215 @@ def _plan_is_file_only(actions: list) -> bool:
     return True
 
 
-def _extract_planned_actions(text: str) -> Tuple[list, str]:
+def _raw_tool_markers_present(text: str) -> bool:
+    """True si el texto parece incluir líneas de herramienta pero no entraron en el plan parseado (evitar ejecución oculta)."""
+    prefixes = (
+        "READ_FILE:",
+        "WRITE_FILE:",
+        "LIST_DIR:",
+        "GREP:",
+        "RUN_COMMAND:",
+        "DELETE_FILE:",
+        "DELETE_DIR:",
+    )
+    for line in (text or "").split("\n"):
+        s = line.strip()
+        s_clean = re.sub(r"^(\d+\.|\-|\*)\s+", "", s)
+        for p in prefixes:
+            if s_clean.startswith(p):
+                return True
+    return False
+
+
+_META_INSTRUCTION_LINE_RES = tuple(
+    re.compile(p, re.I | re.MULTILINE)
+    for p in (
+        r"Escribe\s+WRITE_FILE",
+        r"^\s*Línea\s*\d+\s*:",
+        r"Plan\s+de\s+creatividad",
+        r"^\s*Contenido\s*:\s*$",
+        r"Líneas\s+finales",
+        r"te\s+sugiero\s+",
+        r"debes?\s+(usar|emitir|escribir)\s+",
+        r"formato\s+WRITE_FILE",
+        r"acción\s+WRITE_FILE",
+        r"^\s*Paso\s*\d+\s*:",
+        r"^\s*Step\s*\d+\s*:",
+        r"describe\s+las\s+herramientas",
+    )
+)
+
+
+def _build_tool_response_signals(raw: str) -> dict:
     """
-    Parsea la respuesta y extrae acciones (READ_FILE, WRITE_FILE, etc.) sin ejecutarlas.
-    Devuelve (lista de dicts con type/path/content/pattern/command, texto_con_plan_legible).
+    Señales de contaminación sobre el texto crudo del modelo (sin tolerar plan parcial).
     """
+    text = raw or ""
+    sig = {
+        "has_pseudo_tools": False,
+        "has_meta_instruction_lines": False,
+        "has_invalid_tool_syntax": False,
+    }
+    lines = text.splitlines()
+
+    for line in lines:
+        if _line_is_pseudo_tool(line):
+            sig["has_pseudo_tools"] = True
+            break
+
+    for pat in _META_INSTRUCTION_LINE_RES:
+        if pat.search(text):
+            sig["has_meta_instruction_lines"] = True
+            break
+
+    for line in lines:
+        if line.strip().startswith("```"):
+            sig["has_invalid_tool_syntax"] = True
+            break
+
+    if re.search(r"<<\s*[-']?\s*\w+", text):
+        sig["has_invalid_tool_syntax"] = True
+
+    # End_file debe aparecer como línea limpia (END_FILE solo, o **END_FILE**).
+    for line in lines:
+        if "END_FILE" in (line or "") and not _is_end_file_line(line):
+            sig["has_invalid_tool_syntax"] = True
+            break
+
+    # WRITE_FILE debe ser solo la línea de directiva con una ruta (sin contenido inline).
+    for line in lines:
+        m = re.match(r"^\s*WRITE_FILE\s*:\s*(.+)$", (line or ""), flags=re.I)
+        if not m:
+            continue
+        remainder = (m.group(1) or "").strip()
+        if not remainder:
+            sig["has_invalid_tool_syntax"] = True
+            break
+        if "END_FILE" in remainder.upper():
+            sig["has_invalid_tool_syntax"] = True
+            break
+        # Quitar notas al final (ej. " (raíz del proyecto)" o comentarios) y validar que queda una ruta real.
+        path_candidate = _sanitize_tool_path(remainder)
+        if not path_candidate:
+            sig["has_invalid_tool_syntax"] = True
+            break
+        # Ruta válida en este proyecto: prefijo dockers/... o rutas de repo; sin espacios, sin caracteres raros.
+        if not (path_candidate == "." or re.match(r"^[\w\./\-\+]+$", path_candidate)):
+            sig["has_invalid_tool_syntax"] = True
+            break
+
+    n_write = sum(1 for ln in lines if re.match(r"^\s*WRITE_FILE\s*:", ln, re.I))
+    n_end = sum(1 for ln in lines if _is_end_file_line(ln))
+    if n_write > 0 and n_write != n_end:
+        sig["has_invalid_tool_syntax"] = True
+
+    return sig
+
+
+def _validate_artifact_asset_consistency(actions: list) -> bool:
+    """
+    Consistencia mínima en artefactos estáticos:
+    - Si index.html referencia assets (styles.css / app.js vía src/href), deben existir como WRITE_FILE en el mismo plan.
+    - Si styles.css se crea en el mismo directorio del index.html del plan, el index.html debe incluir el <link rel="stylesheet" ...>.
+    """
+    write_actions = [a for a in actions if (a.get("type") or "").strip() == "WRITE_FILE"]
+    write_paths = set((a.get("path") or "") for a in write_actions if a.get("path"))
+    if not write_actions or not write_paths:
+        return True
+
+    # index.html puede venir en varios directorios.
+    index_actions = [a for a in write_actions if (a.get("path") or "").lower().endswith("index.html")]
+    if not index_actions:
+        return True
+
+    def _dir_of(path: str) -> str:
+        parts = (path or "").split("/")
+        return "/".join(parts[:-1]) if len(parts) > 1 else "."
+
+    def _norm_ref(ref: str) -> str | None:
+        r = (ref or "").strip()
+        if not r:
+            return None
+        if r.startswith("./"):
+            r = r[2:]
+        r = r.split("?", 1)[0].split("#", 1)[0]
+        # URLs externas no se validan contra el plan.
+        if r.startswith("http://") or r.startswith("https://") or r.startswith("//"):
+            return None
+        if r.startswith("/"):
+            # Absoluto no es un recurso del workspace en este modo.
+            return None
+        return r
+
+    for index_action in index_actions:
+        index_path = index_action.get("path") or ""
+        index_dir = _dir_of(index_path)
+        content = index_action.get("content") or ""
+        stylesheet_hrefs = set()
+        script_srcs = set()
+
+        # Extract de href/src (solo comillas simples o dobles).
+        for m in re.finditer(
+            r"<link[^>]+rel=[\"']stylesheet[\"'][^>]*href=[\"']([^\"']+)[\"']",
+            content,
+            flags=re.I,
+        ):
+            stylesheet_hrefs.add(m.group(1))
+
+        for m in re.finditer(
+            r"<script[^>]+src=[\"']([^\"']+)[\"']",
+            content,
+            flags=re.I,
+        ):
+            script_srcs.add(m.group(1))
+
+        # Si index.html referencia algún asset, cada asset debe estar también en el plan.
+        for ref in list(stylesheet_hrefs) + list(script_srcs):
+            ref_raw = (ref or "").strip()
+            if ref_raw.startswith("/"):
+                # Referencias absolutas no son trazables a rutas del workspace con este ejecutor.
+                return False
+            norm = _norm_ref(ref)
+            if not norm:
+                continue
+            expected_path = (index_dir + "/" + norm) if index_dir != "." else norm
+            if expected_path not in write_paths:
+                if _env_truthy("ADA_CHAT_STRICT_DEBUG"):
+                    logger.warning("ADA_CHAT_STRICT_DEBUG asset_missing expected=%r ref=%r index=%r", expected_path, ref, index_path)
+                return False
+
+        # Regla inversa: si styles.css existe en el plan en ese directorio, index.html debe enlazarlo.
+        styles_expected = (index_dir + "/styles.css") if index_dir != "." else "styles.css"
+        if styles_expected in write_paths:
+            styles_refs_norm = {(_norm_ref(h) or "") for h in stylesheet_hrefs}
+            if "styles.css" not in styles_refs_norm:
+                if _env_truthy("ADA_CHAT_STRICT_DEBUG"):
+                    logger.warning("ADA_CHAT_STRICT_DEBUG styles_link_missing index=%r styles_expected=%r", index_path, styles_expected)
+                return False
+
+    return True
+
+
+def _log_chat_tool_validation(raw_model_text: str, actions: list, signals: dict) -> None:
+    if not _env_truthy("ADA_CHAT_STRICT_DEBUG"):
+        return
+    snippet = (raw_model_text or "")[:6000]
+    logger.warning(
+        "ADA_CHAT_STRICT_DEBUG extracted_actions=%r signals=%r model_raw_prefix=%r",
+        actions,
+        signals,
+        snippet,
+    )
+
+
+def _extract_planned_actions(text: str) -> Tuple[list, str, dict]:
+    """
+    Parsea la respuesta y extrae acciones reales. Siempre devuelve señales de contaminación
+    (pseudo-tools, meta-instrucciones, sintaxis inválida) calculadas sobre el texto crudo.
+    """
+    raw = text or ""
+    signals = _build_tool_response_signals(raw)
+    text = _strip_markdown_fence_lines(raw)
     actions = []
     lines = text.split("\n")
     i = 0
@@ -1963,18 +2314,30 @@ def _extract_planned_actions(text: str) -> Tuple[list, str]:
     while i < len(lines):
         line = lines[i]
         s = line.strip()
-        s_clean = re.sub(r"^(\d+\.|\-|\*)\s+", "", s)
-        if s_clean.startswith("READ_FILE:"):
-            path = line.split("READ_FILE:", 1)[1].strip().strip("'\"")
+        if _line_is_pseudo_tool(s):
+            i += 1
+            continue
+        s_clean = re.sub(r"^(\d+\.|\-|\*|\*\*|`+)\s*", "", s).strip().strip("*`")
+        if s_clean.upper().startswith("READ_FILE:"):
+            path = _sanitize_tool_path(s_clean.split(":", 1)[1])
             if path:
                 num += 1
                 actions.append({"type": "READ_FILE", "path": path})
                 plan_lines.append(f"  {num}. LEER archivo: {path}")
             i += 1
             continue
-        if s_clean.startswith("WRITE_FILE:"):
-            path = line.split("WRITE_FILE:", 1)[1].strip().strip("'\"")
-            i += 1
+        if s_clean.upper().startswith("WRITE_FILE:"):
+            path = _sanitize_tool_path(s_clean.split(":", 1)[1])
+            j = i + 1
+            if not path and j < len(lines):
+                cand = lines[j].strip().strip("*`")
+                if _looks_like_single_path_line(cand):
+                    path = _sanitize_tool_path(cand)
+                    j += 1
+            if not path:
+                i += 1
+                continue
+            i = j
             content_lines = []
             while i < len(lines) and not _is_end_file_line(lines[i]):
                 content_lines.append(lines[i])
@@ -1984,45 +2347,44 @@ def _extract_planned_actions(text: str) -> Tuple[list, str]:
             content = "\n".join(content_lines)
             num += 1
             actions.append({"type": "WRITE_FILE", "path": path, "content": content})
-            preview = content[:80].replace("\n", " ") + ("..." if len(content) > 80 else "")
             plan_lines.append(f"  {num}. ESCRIBIR archivo: {path} ({len(content_lines)} líneas)")
             continue
-        if s_clean.startswith("LIST_DIR:"):
-            path = line.split("LIST_DIR:", 1)[1].strip().strip("'\"").strip() or "."
+        if s_clean.upper().startswith("DIR_LIST:") or s_clean.upper().startswith("LIST_DIR:"):
+            path = _sanitize_tool_path(s_clean.split(":", 1)[1]) or "."
             num += 1
             actions.append({"type": "LIST_DIR", "path": path})
             plan_lines.append(f"  {num}. LISTAR directorio: {path}")
             i += 1
             continue
-        if s_clean.startswith("DELETE_FILE:"):
-            path = line.split("DELETE_FILE:", 1)[1].strip().strip("'\"")
+        if s_clean.upper().startswith("DELETE_FILE:"):
+            path = _sanitize_tool_path(s_clean.split(":", 1)[1])
             if path:
                 num += 1
                 actions.append({"type": "DELETE_FILE", "path": path})
                 plan_lines.append(f"  {num}. ELIMINAR archivo: {path}")
             i += 1
             continue
-        if s_clean.startswith("DELETE_DIR:"):
-            path = line.split("DELETE_DIR:", 1)[1].strip().strip("'\"")
+        if s_clean.upper().startswith("DELETE_DIR:"):
+            path = _sanitize_tool_path(s_clean.split(":", 1)[1])
             if path:
                 num += 1
                 actions.append({"type": "DELETE_DIR", "path": path})
                 plan_lines.append(f"  {num}. ELIMINAR carpeta (vacía): {path}")
             i += 1
             continue
-        if s_clean.startswith("GREP:"):
-            rest = line.split("GREP:", 1)[1].strip().strip("'\"")
+        if s_clean.upper().startswith("GREP:"):
+            rest = s_clean.split(":", 1)[1].strip().strip("'\"")
             parts = rest.split(None, 1)
-            pattern = parts[0] if parts else ""
-            path_limit = parts[1].strip() if len(parts) > 1 else None
+            pattern = (parts[0] or "") if parts else ""
+            path_limit = _sanitize_tool_path(parts[1]) if len(parts) > 1 else None
             if pattern:
                 num += 1
                 actions.append({"type": "GREP", "pattern": pattern, "path_limit": path_limit})
                 plan_lines.append(f"  {num}. BUSCAR en archivos: '{pattern}'" + (f" en {path_limit}" if path_limit else ""))
             i += 1
             continue
-        if s_clean.startswith("RUN_COMMAND:"):
-            cmd = line.split("RUN_COMMAND:", 1)[1].strip().strip("'\"")
+        if s_clean.upper().startswith("RUN_COMMAND:"):
+            cmd = _sanitize_run_command_arg(s_clean.split(":", 1)[1])
             if cmd:
                 num += 1
                 actions.append({"type": "RUN_COMMAND", "command": cmd})
@@ -2031,9 +2393,9 @@ def _extract_planned_actions(text: str) -> Tuple[list, str]:
             continue
         i += 1
     if not actions:
-        return [], text
+        return [], raw, signals
     plan_block = "\n\n--- Plan propuesto por ADA (pendiente de tu aprobación) ---\n" + "\n".join(plan_lines) + "\n--- Usa el botón «Ejecutar plan» para aplicar estas acciones o pide cambios en el chat. ---"
-    return actions, text + plan_block
+    return actions, raw + plan_block, signals
 
 
 def _execute_plan(plan: list) -> Tuple[bool, list]:

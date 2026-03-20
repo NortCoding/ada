@@ -1,17 +1,10 @@
-# ADA Self-Autonomy Plan Steps from Approved Plan
+# TODO Steps: Fix Web Admin Root Redirect to ADA V1
+Status: [ ] Not started | [ ] In progress | [x] Pending execution | [ ] Done
 
-Status: Starting step-by-step implementation.
-
-1. ~~Update docker-compose.yml~~ ✅
-2. ~~agent-core /web_search~~ ✅
-3. ~~agent-core /self_improve~~ ✅
-4. ~~agent-core /spawn_agent full impl~~ ✅
-5. autonomous-orchestrator extend 24h
-6. scripts/quick-demo.sh full test
-7. scripts/auto-orchestrator.sh cron
-8. ada/prompts/self_improve.md refine
-9. tests/test_self_improve.py e2e
-10. Full test & docker up → attempt_completion
-
-Next: Implement step 5 (autonomous-orchestrator extend 24h) in autonomous-orchestrator/orchestrator_6h.py.
-
+## Steps
+1. [x] Plan approved - Root `/` → AppV1, `/v2/*` → AppV2
+2. [x] Edit `web-admin/frontend/src/main.jsx` - Swap routes ✅
+3. [x] Rebuild frontend: `cd web-admin/frontend && npm run build` ✅ (vite build complete)
+4. [x] Restart service: `docker compose restart chat_interface` ✅
+5. [ ] Test: `open http://localhost:8080/` loads V1; `/v2/developer` loads V2
+6. [ ] Complete task
