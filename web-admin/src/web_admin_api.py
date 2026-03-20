@@ -34,19 +34,30 @@ UI_RUN_ALLOWLIST = [
 ]
 UI_RUN_TIMEOUT = int(os.getenv("ADA_UI_RUN_TIMEOUT", "60"))
 
-FRONTEND_DIST = "/frontend/dist"
+FRONTEND_V1_DIST = "/frontend/v1/dist"
+FRONTEND_LEGACY_DIST = "/frontend/legacy/dist"
 
 
-def _frontend_exists() -> bool:
+def _frontend_v1_exists() -> bool:
     try:
-        return os.path.isfile(os.path.join(FRONTEND_DIST, "index.html"))
+        return os.path.isfile(os.path.join(FRONTEND_V1_DIST, "index.html"))
+    except Exception:
+        return False
+
+def _frontend_legacy_exists() -> bool:
+    try:
+        return os.path.isfile(os.path.join(FRONTEND_LEGACY_DIST, "index.html"))
     except Exception:
         return False
 
 
 # Static assets (React build)
-if os.path.isdir(os.path.join(FRONTEND_DIST, "assets")):
-    app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIST, "assets")), name="assets")
+if os.path.isdir(os.path.join(FRONTEND_V1_DIST, "assets")):
+    app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_V1_DIST, "assets")), name="assets")
+
+# Legacy frontend mount
+if os.path.isdir(FRONTEND_LEGACY_DIST):
+    app.mount("/legacy", StaticFiles(directory=FRONTEND_LEGACY_DIST, html=True), name="legacy")
 
 
 @app.get("/health")
@@ -57,9 +68,9 @@ async def health():
 @app.get("/")
 async def index():
     """Serve SPA index if available; otherwise show API status."""
-    if _frontend_exists():
-        return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
-    return {"status": "ok", "detail": "Frontend not built/mounted. Expected /frontend/dist/index.html"}
+    if _frontend_v1_exists():
+        return FileResponse(os.path.join(FRONTEND_V1_DIST, "index.html"))
+    return {"status": "ok", "ada_v1": True, "detail": "Frontend v1 not built/mounted. Expected /frontend/v1/dist/index.html"}
 
 
 # -----------------------
@@ -99,8 +110,8 @@ async def api_agent_health():
 
 @app.get("/api/agent/status")
 async def api_agent_status():
-    """ADA v1: estado mínimo sin depender de endpoints autónomos legacy."""
-    return {"status": "ok", "ada_v1": True, "model_hint": "ollama_local"}
+    """ADA v1: Dashboard mínimo - chat/files/plans/results."""
+    return {"status": "ok", "ada_v1": True, "features": ["chat", "file_ops", "execute_plan"], "legacy_disabled": True}
 
 
 @app.get("/api/autonomous/plan")
@@ -447,6 +458,14 @@ async def spa_fallback(path: str):
     """SPA fallback: return index.html for non-API routes. Must be registered LAST."""
     if path.startswith("api/") or path in ("health",):
         raise HTTPException(status_code=404, detail="Not found")
-    if _frontend_exists():
-        return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
-    raise HTTPException(status_code=404, detail="Frontend not available")
+    
+    # Legacy fallback
+    if path.startswith("legacy/"):
+        if _frontend_legacy_exists():
+            return FileResponse(os.path.join(FRONTEND_LEGACY_DIST, "index.html"))
+        raise HTTPException(status_code=404, detail="Legacy frontend not available")
+
+    # V1 fallback
+    if _frontend_v1_exists():
+        return FileResponse(os.path.join(FRONTEND_V1_DIST, "index.html"))
+    raise HTTPException(status_code=404, detail="Frontend v1 not available")

@@ -47,6 +47,7 @@ services:
       ADA_ENV: ${ADA_ENV:-development}
       ADA_WORKSPACE: ${ADA_WORKSPACE:-/workspace}
       ADA_PROJECTS_ROOT: ${ADA_PROJECTS_ROOT:-/dockers}
+      ADA_V1_STRICT: ${ADA_V1_STRICT:-0}
       ADA_ALLOW_RUN_COMMAND: ${ADA_ALLOW_RUN_COMMAND:-1}
       ADA_RUN_COMMAND_ALLOWLIST: ${ADA_RUN_COMMAND_ALLOWLIST:-}
       ADA_RUN_COMMAND_TIMEOUT: ${ADA_RUN_COMMAND_TIMEOUT:-60}
@@ -93,7 +94,8 @@ services:
       - "8080:8080"
     volumes:
       - ./web-admin/src:/app
-      - ./web-admin/frontend/dist:/frontend/dist
+      - ./web-admin/frontend-v1/dist:/frontend/v1/dist
+      - ./web-admin/frontend/dist:/frontend/legacy/dist
       - ${ADA_PROJECTS_PATH:-/Volumes/Datos/dockers}:/dockers
 
 volumes:
