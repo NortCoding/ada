@@ -137,9 +137,29 @@ def compute_evolution_score(proposals: List[dict]) -> dict:
         roi = sim.get("ROI")
         risk = sim.get("risk")
         if roi is not None:
-            rois.append(float(roi))
+            try:
+                rois.append(float(roi))
+            except (TypeError, ValueError):
+                pass
         if risk is not None:
-            risks.append(float(risk))
+            if isinstance(risk, str):
+                r = risk.strip().lower()
+                if r in ("low", "bajo"):
+                    risks.append(0.2)
+                elif r in ("medium", "med", "medio"):
+                    risks.append(0.5)
+                elif r in ("high", "alto"):
+                    risks.append(0.8)
+                else:
+                    try:
+                        risks.append(float(risk))
+                    except (TypeError, ValueError):
+                        pass
+            else:
+                try:
+                    risks.append(float(risk))
+                except (TypeError, ValueError):
+                    pass
     avg_roi = sum(rois) / len(rois) if rois else 0
     avg_risk = sum(risks) / len(risks) if risks else 0.5
     # Estabilidad y precisión simplificadas desde variabilidad

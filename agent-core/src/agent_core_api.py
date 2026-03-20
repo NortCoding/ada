@@ -11,7 +11,7 @@ import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Any, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 SYDNEY_TZ = ZoneInfo("Australia/Sydney")
@@ -46,6 +46,8 @@ try:
         start_scheduler()
 except ImportError:
     pass
+
+from ada_core.conversation_engine import ConversationEngine
 
 # Servicios opcionales (simulación, policy, logging, task-runner, ledger). Si no están, se omiten.
 SIM_URL = (os.getenv("SIM_URL") or "").strip()
@@ -108,6 +110,83 @@ Herramientas para interactuar con archivos y directorios. IMPORTANTE: usa siempr
 - EJECUTAR comando en la raíz del proyecto: RUN_COMMAND: comando (solo comandos permitidos; no rm -rf, sudo, etc.).
 Cuando uses estas líneas, el sistema mostrará primero un PLAN con las acciones propuestas; el usuario lo leerá y podrá aprobar o descartar. No se ejecuta nada hasta que apruebe. Si no necesitas herramientas, responde normal sin usarlas.
 """
+
+
+def _load_tools_execution_prompt() -> str:
+    """Loads strict execution-mode prompt from ada/prompts/tools_execution.md (best-effort)."""
+    try:
+        workspace = (os.getenv("ADA_WORKSPACE") or "/workspace").rstrip("/")
+        p = os.path.join(workspace, "ada", "prompts", "tools_execution.md")
+        if os.path.isfile(p):
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                return f.read().strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _parse_strict_execution(text: str) -> Tuple[bool, list, str]:
+    """
+    Strict parser for EXECUTION MODE. Accepts ONLY:
+    - DIR_LIST with path
+    - FILE_READ with path
+    - FILE_WRITE with path + content + END_FILE
+    No extra text allowed outside blocks (blank lines ok).
+    Returns (ok, actions, error_message).
+    """
+    if not text or not str(text).strip():
+        return False, [], "Empty execution output"
+
+    lines = str(text).splitlines()
+    i = 0
+    actions = []
+
+    def _consume_blanks(idx: int) -> int:
+        while idx < len(lines) and lines[idx].strip() == "":
+            idx += 1
+        return idx
+
+    i = _consume_blanks(i)
+    while i < len(lines):
+        head = lines[i].strip()
+        if head not in ("DIR_LIST:", "FILE_READ:", "FILE_WRITE:"):
+            return False, [], f"Invalid execution header: {head[:80]}"
+
+        if head in ("DIR_LIST:", "FILE_READ:"):
+            kind = "LIST_DIR" if head == "DIR_LIST:" else "READ_FILE"
+            i += 1
+            if i >= len(lines) or not lines[i].startswith("path:"):
+                return False, [], f"Missing path for {head}"
+            path = lines[i].split("path:", 1)[1].strip()
+            if not path or path.startswith("/") or ".." in path.split("/"):
+                return False, [], f"Invalid path: {path!r}"
+            actions.append({"type": kind, "path": path})
+            i += 1
+            i = _consume_blanks(i)
+            continue
+
+        # FILE_WRITE
+        i += 1
+        if i >= len(lines) or not lines[i].startswith("path:"):
+            return False, [], "Missing path for FILE_WRITE"
+        path = lines[i].split("path:", 1)[1].strip()
+        if not path or path.startswith("/") or ".." in path.split("/"):
+            return False, [], f"Invalid path: {path!r}"
+        i += 1
+        if i >= len(lines) or lines[i].strip() != "content:":
+            return False, [], "Missing content: header for FILE_WRITE"
+        i += 1
+        content_lines = []
+        while i < len(lines) and lines[i].strip() != "END_FILE":
+            content_lines.append(lines[i])
+            i += 1
+        if i >= len(lines) or lines[i].strip() != "END_FILE":
+            return False, [], "Missing END_FILE for FILE_WRITE"
+        i += 1
+        actions.append({"type": "WRITE_FILE", "path": path, "content": "\n".join(content_lines)})
+        i = _consume_blanks(i)
+
+    return True, actions, ""
 
 
 # Directrices: acciones de aprendizaje/plan no requieren aprobación humana (solo se muestra al usuario).
@@ -174,6 +253,10 @@ class ChatRequest(BaseModel):
     history: Optional[list[ChatMessage]] = None
     # Imagen en base64 (con o sin prefijo data:image/...;base64,) para que ADA pueda leer imágenes (Ollama/Gemini visión)
     image_base64: Optional[str] = None
+    # v3 workspace: developer | business | research | general (carga solo habilidades de ese agente)
+    agent_type: Optional[str] = None
+    # Strict execution mode: only execution blocks are allowed (FILE_WRITE/FILE_READ/DIR_LIST)
+    execution_mode: bool = False
 
 
 def _post(url: str, json_data: dict) -> Tuple[Any, int]:
@@ -630,7 +713,24 @@ def chat(req: ChatRequest):
 def _chat_impl(req: ChatRequest):
     """Implementación del chat (separada para manejo de errores)."""
     message = (req.message or "").strip()
+    
+    # INTENT ROUTER HOOK: Re-route slash commands to ADA's cognitive skills system
+    if message.startswith("/"):
+        ce = ConversationEngine()
+        history_dicts = []
+        if req.history:
+            for h in req.history:
+                history_dicts.append({"role": h.role, "content": h.get_content()})
+        agent_type = getattr(req, "agent_type", None) or (req.agent_type if hasattr(req, "agent_type") else None)
+        reply = ce.respond(message, history=history_dicts, agent_type=agent_type)
+        return {"response": reply, "status": "done", "brain": "ada_router"}
+
     use_ollama = req.use_ollama if hasattr(req, "use_ollama") else True
+    execution_mode = bool(getattr(req, "execution_mode", False))
+    # También permitir activación por comando (sin tocar UI): "/exec " o "/execute "
+    if message.lower().startswith("/exec ") or message.lower().startswith("/execute "):
+        execution_mode = True
+        message = message.split(" ", 1)[1].strip() if " " in message else ""
     # Si el usuario pide explícitamente crear la oferta, ADA lo hace con autonomía
     if any(k in message.lower() for k in ("crea la oferta", "crear primera oferta", "crea tu primera oferta", "ada crea la oferta", "que ada cree la oferta")):
         out = _create_first_offer_impl()
@@ -663,6 +763,20 @@ def _chat_impl(req: ChatRequest):
             system_content = ADA_SYSTEM_PROMPT + financial_context + datetime_context + registration_context + plan_context
             if os.getenv("ADA_WORKSPACE", "").strip() or os.getenv("ADA_PROJECTS_ROOT", "").strip():
                 system_content += ADA_TOOLS_FILE_PROMPT
+            # v3 strict execution mode: load dedicated prompt and enforce strict parsing (no free text execution)
+            if execution_mode:
+                exec_prompt = _load_tools_execution_prompt()
+                if exec_prompt:
+                    system_content += "\n\n" + exec_prompt
+                else:
+                    system_content += "\n\nYou are in EXECUTION MODE. Output ONLY valid execution blocks (DIR_LIST/FILE_READ/FILE_WRITE)."
+            # v3: inject workspace agent skills when agent_type is set
+            agent_type = getattr(req, "agent_type", None) or (req.agent_type if hasattr(req, "agent_type") else None)
+            if agent_type:
+                from ada_core.agent_manager import get_agent_skills
+                skills = [s for s in get_agent_skills(agent_type) if s in ("coding", "code_review", "architecture", "strategy", "research", "web_research", "learning")]
+                if skills:
+                    system_content += "\n\nWorkspace: " + agent_type + ". Available skills: " + ", ".join(skills) + "."
 
             messages = _build_chat_messages(req, system_content)
             # Ollama es la base: siempre se usa primero. Gemini solo si use_advanced_brain=True.
@@ -720,6 +834,21 @@ def _chat_impl(req: ChatRequest):
                             text = (msg.get("content") or data.get("response") or "").strip()
                             if text:
                                 last_text = text
+                                if execution_mode:
+                                    ok, strict_actions, err = _parse_strict_execution(text)
+                                    if not ok:
+                                        # Do NOT execute anything when strict format is invalid
+                                        return {
+                                            "response": f"ERROR: Tool command required but not used. ({err})",
+                                            "status": "error",
+                                            "brain": "ollama",
+                                        }
+                                    _all_ok, strict_results = _execute_plan(strict_actions)
+                                    return {
+                                        "response": "\n".join(strict_results),
+                                        "status": "done",
+                                        "brain": "ollama",
+                                    }
                                 planned_actions, text_with_plan = _extract_planned_actions(text)
                                 if planned_actions:
                                     # Si el plan solo tiene acciones de archivo (WRITE_FILE, READ_FILE, etc.), ejecutar ya
@@ -1774,24 +1903,33 @@ def _do_run_command(cmd: str) -> Tuple[bool, str]:
     if any(b in cmd for b in blocked):
         return False, "Comando bloqueado por seguridad."
     try:
-        workspace = os.getenv("ADA_WORKSPACE", "/tmp/ada_workspace").rstrip("/")
-        r = subprocess.run(
-            cmd,
-            shell=True,
-            cwd=workspace,
-            capture_output=True,
-            timeout=int(os.getenv("ADA_RUN_COMMAND_TIMEOUT", "60")),
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+        # Enviar comando a través del flujo de la arquitectura (simulación -> policy -> task-runner)
+        proposal = Proposal(
+            task_name="bash_command",
+            details={
+                "command": cmd,
+                "timeout_seconds": int(os.getenv("ADA_RUN_COMMAND_TIMEOUT", "60")),
+                "description": f"Ejecutar comando bash: {cmd}"
+            }
         )
-        out = (r.stdout or "").strip()
-        err = (r.stderr or "").strip()
-        if r.returncode != 0:
-            return False, f"exit {r.returncode}\nstdout: {out[:2000]}\nstderr: {err[:2000]}"
-        return True, (out or "(sin salida)")[:4000]
-    except subprocess.TimeoutExpired:
-        return False, "Comando superó el tiempo límite."
+        # route down to propose_task (execution is True to allow task-runner to handle it if policy approves)
+        result = propose_task(proposal, execute=True)
+        
+        task_res = result.get("task_result")
+        if task_res and task_res.get("status") == "success":
+            details = task_res.get("details", {})
+            out = details.get("stdout", "")
+            err = details.get("stderr", "")
+            if not details.get("success"):
+                return False, f"exit {details.get('exit_code', 1)}\nstdout: {out[:2000]}\nstderr: {err[:2000]}"
+            return True, (out or "(sin salida)")[:4000]
+        elif task_res and task_res.get("status") == "failed":
+             return False, str(task_res.get("error", "Error desconocido en task-runner"))
+        elif task_res and task_res.get("status") == "pending_approval":
+             return False, "El comando requiere aprobación manual (Policy Engine)."
+        else:
+             return False, f"Ejecución bloqueada o fallida: {result.get('status')} - {result.get('policy', {}).get('reason')}"
+
     except Exception as e:
         return False, str(e)
 
@@ -2087,6 +2225,222 @@ def autonomous_write_file(body: dict = Body(default={})):
         return {"status": "error", "detail": f"No se pudo escribir: {e}"}
 
 
+@app.get("/web_search")
+def web_search(query: str):
+    """
+    Web research for ADA learning/self_improve (safe DuckDuckGo lite scrape).
+    Query: ?query=autonomous+llm+self+modify → curl lite → Ollama summarize.
+    """
+    if not query:
+        return {"status": "error", "detail": "Missing query param"}
+
+    # Safe DuckDuckGo lite (text-only, no JS/trackers)
+    url = f"https://duckduckgo.com/lite/?q={requests.utils.quote(query)}"
+    try:
+        r = requests.get(url, timeout=10)
+        if r.status_code != 200:
+            return {"status": "error", "detail": f"HTTP {r.status_code}"}
+
+        # Extract top results (simple parse)
+        html = r.text
+        results = re.findall(r'<a rel="nofollow" href="([^"]*)"[^>]*>([^<]*)</a>', html)[:5]
+        snippets = [f"{title}: {link}" for link, title in results]
+        raw = "\n".join(snippets)[:4000]
+
+        # Ollama summarize
+        prompt = (
+            f"Summarize key insights from web search '{query}':\n{raw}\n\n"
+            f'JSON: {{"insights": ["bullet1", "bullet2"], "sources": {len(results)}}}'
+        )
+        ollama_payload = {
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "options": {"num_predict": 512},
+        }
+        o_r = requests.post(OLLAMA_URL, json=ollama_payload, timeout=30)
+        if o_r.status_code == 200:
+            summary = o_r.json().get("response", raw[:500])
+            return {"status": "ok", "query": query, "summary": summary, "raw_snippets": snippets}
+        return {"status": "ok", "query": query, "raw_snippets": snippets[:3]}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+
+@app.get("/self_improve")
+def self_improve(trigger: str = "auto"):
+    """
+    ADA Self-Improvement: learnings + web_search → propose/apply safe code diffs.
+    """
+    # Gather context
+    learn_resp, _ = _get(MEMORY_URL + "/get_many?keys=human_decisions,evolution_score")
+    learnings = learn_resp
+    score = learnings.get("evolution_score", {"composite": 0.5})["composite"]
+
+    # Web research
+    web_q = "llm autonomous agent self improve code patterns docker spawn"
+    web = web_search(web_q)
+    web_insights = web.get("summary", "")
+
+    # Read self + prompt
+    code_ok, code = _do_read_file("agent-core/src/agent_core_api.py")
+    prompt_ok, self_prompt = _do_read_file("ada/prompts/self_improve.md")
+    if not code_ok:
+        code = ""
+    if not prompt_ok:
+        self_prompt = "Propose low-risk JSON edits."
+
+    prompt = f"{self_prompt}\n\nCode: {code[:3000]}\nLearnings: {json.dumps(learnings)[:1000]}\nWeb: {web_insights}\nScore: {score}"
+
+    ollama_p = {"model": OLLAMA_MODEL, "prompt": prompt, "options": {"num_predict": 1024}}
+    o_r = requests.post(OLLAMA_URL, json=ollama_p, timeout=60)
+    resp = "{}"
+    if o_r.status_code == 200:
+        try:
+            resp = o_r.json().get("response", "{}")
+        except Exception:
+            # Ollama may return non-JSON or concatenated payloads in some failures.
+            raw = (o_r.text or "").strip()
+            m = re.search(r"\{[\s\S]*\}", raw)
+            resp = m.group(0) if m else "{}"
+
+    try:
+        edits_json = json.loads(resp)
+        edits = edits_json.get("edits", [])
+        risk = edits_json.get("risk", "high")
+    except Exception:
+        return {"status": "parse_fail", "raw": resp}
+
+    # Low-risk auto-apply (no POLICY_URL, <3 edits, low risk)
+    if not POLICY_URL and risk == "low" and len(edits) <= 3:
+        applied = []
+        for e in edits:
+            f = e.get("file")
+            old = e.get("old_str")
+            new = e.get("new_str")
+            if f and old and new:
+                ok_f, current = _do_read_file(f)
+                if ok_f and old in current:
+                    updated = current.replace(old, new, 1)
+                    _, msg = _do_write_file(f, updated)
+                    applied.append({"file": f, "msg": msg})
+        _post_optional(LOG_URL, {"service_name": "self_improve", "event_type": "auto_applied", "payload": {"edits": len(applied)}})
+        return {"status": "improved", "applied": len(applied), "details": applied, "est_score": score + 0.15}
+    return {"status": "proposed", "risk": risk, "edits": edits, "needs_review": True}
+
+
+@app.get("/spawn_agent")
+def spawn_agent(agent_name: str = "ALMA"):
+    """
+    Spawn agent from specs: generate files → docker-compose append (idempotente) → up.
+    """
+    raw_name = (agent_name or "ALMA").strip()
+    if not re.match(r"^[A-Za-z][A-Za-z0-9_-]{1,31}$", raw_name):
+        return {"status": "error", "detail": "agent_name inválido. Usa letras/números/_/- y empieza por letra."}
+
+    safe_name = raw_name
+    service_name = f"agent-{safe_name.lower()}"
+    container_name = f"ada_{safe_name.lower()}"
+
+    specs_text = ""
+    ok_specs, specs_out = _do_read_file("agentSpecifications.md")
+    if ok_specs:
+        specs_text = specs_out[:2500]
+
+    agent_dir = f"agents/{safe_name}"
+    dockerfile = f"""FROM python:3.11-slim
+WORKDIR /app/{safe_name}
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY src ./src
+ENV AGENT_NAME={safe_name}
+EXPOSE 3011
+CMD ["python", "src/agent_api.py"]
+"""
+    api_stub = f"""from fastapi import FastAPI
+
+app = FastAPI(title="{safe_name} Agent", version="0.1.0")
+
+@app.get("/health")
+def health():
+    return {{"agent": "{safe_name}", "status": "ready"}}
+
+@app.get("/")
+def root():
+    return {{"agent": "{safe_name}", "message": "Agent active"}}
+"""
+    requirements_txt = "fastapi==0.115.0\nuvicorn==0.30.6\n"
+
+    writes = []
+    ok, msg = _do_write_file(f"{agent_dir}/Dockerfile", dockerfile)
+    writes.append({"file": f"{agent_dir}/Dockerfile", "ok": ok, "msg": msg})
+    ok, msg = _do_write_file(f"{agent_dir}/src/agent_api.py", api_stub)
+    writes.append({"file": f"{agent_dir}/src/agent_api.py", "ok": ok, "msg": msg})
+    ok, msg = _do_write_file(f"{agent_dir}/requirements.txt", requirements_txt)
+    writes.append({"file": f"{agent_dir}/requirements.txt", "ok": ok, "msg": msg})
+
+    if not all(w["ok"] for w in writes):
+        return {"status": "error", "detail": "No se pudieron escribir todos los archivos.", "writes": writes}
+
+    compose_rel = "docker-compose.yml"
+    compose_ok, compose_content = _do_read_file(compose_rel)
+    if not compose_ok:
+        return {"status": "error", "detail": f"No se pudo leer {compose_rel}: {compose_content}", "writes": writes}
+
+    service_marker = f"  {service_name}:"
+    compose_updated = False
+    if service_marker not in compose_content:
+        insertion_block = f"""
+
+  {service_name}:
+    build: ./{agent_dir}
+    container_name: {container_name}
+    ports:
+      - "3011:3011"
+"""
+        if "\nvolumes:\n" in compose_content:
+            compose_content = compose_content.replace("\nvolumes:\n", insertion_block + "\nvolumes:\n", 1)
+        else:
+            compose_content = compose_content.rstrip() + insertion_block + "\n"
+        w_ok, w_msg = _do_write_file(compose_rel, compose_content)
+        if not w_ok:
+            return {"status": "error", "detail": f"No se pudo actualizar {compose_rel}: {w_msg}", "writes": writes}
+        compose_updated = True
+
+    up_stdout = ""
+    up_stderr = ""
+    up_rc = 0
+    try:
+        proc = subprocess.run(
+            ["docker", "compose", "up", "-d", service_name],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        up_stdout = (proc.stdout or "")[:2000]
+        up_stderr = (proc.stderr or "")[:2000]
+        up_rc = int(proc.returncode or 0)
+    except Exception as e:
+        up_stderr = str(e)
+        up_rc = 1
+
+    status = "spawned" if up_rc == 0 else "spawned_files_only"
+    return {
+        "status": status,
+        "agent": safe_name,
+        "service_name": service_name,
+        "compose_updated": compose_updated,
+        "specs_context_used": bool(specs_text),
+        "files": [w["file"] for w in writes],
+        "docker_up": {
+            "ok": up_rc == 0,
+            "returncode": up_rc,
+            "stdout": up_stdout,
+            "stderr": up_stderr,
+        },
+        "next": f"docker compose logs -f {service_name}",
+    }
+
+
 @app.post("/generate")
 def generate_and_propose(req: Optional[GenerateRequest] = None):
     """
@@ -2235,6 +2589,125 @@ try:
     def v3_research(goal: str = Body(..., embed=True), context: str = Body("", embed=True)):
         """Research a goal; returns analysis/strategies."""
         return {"analysis": research_goal(goal, context)}
+
+    # --- ADA v3 workspaces & agent market ---
+    from ada_core.agent_manager import list_agents, get_agent_skills
+    from ada_core.agent_market import list_agent_proposals, propose_new_agent
+
+    @app.get("/v3/agents")
+    def v3_list_agents():
+        """List available workspace agent types (developer, business, research, general)."""
+        return {"agents": list_agents()}
+
+    @app.get("/v3/agents/{agent_type}/skills")
+    def v3_agent_skills(agent_type: str):
+        """Skills for a given agent type."""
+        return {"agent_type": agent_type, "skills": get_agent_skills(agent_type)}
+
+    @app.get("/agent_market/proposals")
+    def agent_market_proposals(status: Optional[str] = None):
+        """List agent proposals (pending/approved/rejected)."""
+        return {"proposals": list_agent_proposals(status=status)}
+
+    @app.post("/agent_market/propose")
+    def agent_market_propose(
+        domain: str = Body(..., embed=True),
+        required_skills: List[str] = Body(..., embed=True),
+        purpose: str = Body("", embed=True),
+    ):
+        """Propose a new agent (human approval required to create)."""
+        result = propose_new_agent(domain, required_skills, purpose)
+        if not result.get("ok"):
+            raise HTTPException(status_code=400, detail=result.get("error", "Proposal failed"))
+        return result
+
+    def _get_hardware_telemetry():
+        """Get basic CPU and Memory usage without psutil if possible."""
+        telemetry = {"cpu_usage_percent": 0, "memory_usage_percent": 0, "disk_usage": {"percent": 0}}
+        try:
+            # CPU (Load average as proxy)
+            load1, _, _ = os.getloadavg()
+            import multiprocessing
+            cpus = multiprocessing.cpu_count()
+            telemetry["cpu_usage_percent"] = min(100, int((load1 / cpus) * 100))
+            
+            # Memory (from /proc/meminfo)
+            if os.path.exists("/proc/meminfo"):
+                with open("/proc/meminfo", "r") as f:
+                    meminfo = {line.split(":")[0]: line.split(":")[1].strip() for line in f}
+                    total = int(meminfo.get("MemTotal", "0").split()[0])
+                    available = int(meminfo.get("MemAvailable", meminfo.get("MemFree", "0")).split()[0])
+                    if total > 0:
+                        telemetry["memory_usage_percent"] = int(((total - available) / total) * 100)
+            
+            # Disk (using df)
+            res = subprocess.run(["df", "-h", "/"], capture_output=True, text=True)
+            if res.returncode == 0:
+                lines = res.stdout.strip().split("\n")
+                if len(lines) > 1:
+                    parts = lines[1].split()
+                    if len(parts) > 4:
+                        percent_str = parts[4].replace("%", "")
+                        telemetry["disk_usage"]["percent"] = int(percent_str)
+        except Exception:
+            pass
+        return telemetry
+
+    def _check_service_health(url: str) -> str:
+        if not url: return "offline"
+        try:
+            r = requests.get(f"{url.rstrip('/')}/health", timeout=2)
+            return "ok" if r.status_code == 200 else "error"
+        except Exception:
+            return "offline"
+
+    @app.get("/system/monitor")
+    def system_monitor():
+        """System monitor: hardware telemetry + service health + ADA state."""
+        try:
+            telemetry = _get_hardware_telemetry()
+            
+            # Check Postgres via psycopg2 if possible
+            db_status = "offline"
+            try:
+                import psycopg2
+                conn = psycopg2.connect(
+                    host=os.getenv("PG_HOST", "postgres"),
+                    port=os.getenv("PG_PORT", "5432"),
+                    user=os.getenv("PG_USER", "ada_user"),
+                    password=os.getenv("PG_PASSWORD", "supersecret"),
+                    dbname=os.getenv("PG_DB", "ada_main"),
+                    connect_timeout=2
+                )
+                conn.close()
+                db_status = "ok"
+            except Exception:
+                db_status = "error"
+
+            services = {
+                "db": db_status,
+                "task_runner": _check_service_health(TASK_URL),
+                "memory_service": _check_service_health(MEMORY_URL),
+            }
+
+            goals = _v2_memory.get_active_goals()
+            opportunities = _v2_memory.get_opportunities(status="pending")[:10]
+            experiences = _v2_memory.get_recent_experiences(limit=10)
+            plans = _v2_memory.get_action_plans(limit=5) if hasattr(_v2_memory, "get_action_plans") else []
+            
+            return {
+                "agents": list_agents(),
+                "goals_count": len(goals),
+                "goals": goals[:5],
+                "opportunities_count": len(opportunities),
+                "opportunities": opportunities[:5],
+                "recent_experiences": experiences,
+                "recent_plans": plans,
+                "services": services,
+                **telemetry
+            }
+        except Exception as e:
+            return {"error": str(e), "agents": list_agents(), "services": {"db": "offline", "task_runner": "offline"}}
 
 except ImportError:
     pass

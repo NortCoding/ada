@@ -1,11 +1,6 @@
 """
-Web Search Tool for ADA.
-Provides internet search capabilities using DuckDuckGo directly (no API key required).
+Web Search Tool for ADA. Fase 3: DuckDuckGo HTML search (no API key required).
 """
-import time
-from typing import List, Dict
-
-import logging
 from typing import List, Dict
 
 import requests

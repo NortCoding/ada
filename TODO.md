@@ -13,15 +13,24 @@ Status: Approved & In Progress (5/10) | Target: Self-sufficient code-creating/le
 
 5. [x] autonomous-orchestrator/orchestrator_6h.py: Extend to 24h loop: proposals → /self_improve + /spawn_agent if score<0.7. ✅
 
-6. [ ] scripts/quick-demo.sh: Full up (extended) + Ollama pull + test /web_search/self_improve.
+6. [x] scripts/quick-demo.sh: Full up (extended) + Ollama pull + test /web_search/self_improve. ✅
 
-7. [ ] scripts/auto-orchestrator.sh: Cron loop (*/30min: advance_next_step + self_improve).
+7. [x] scripts/auto-orchestrator.sh: Cron loop (*/30min: advance_next_step + self_improve). ✅
 
-8. [ ] ada/prompts/self_improve.md: System prompt for code self-modify + web learnings.
+8. [x] ada/prompts/self_improve.md: System prompt for code self-modify + web learnings. ✅
 
-9. [ ] tests/test_self_improve.py: e2e tests (spawn ALMA, verify files/service).
+9. [x] tests/test_self_improve.py: e2e tests (spawn ALMA, verify files/service). ✅
 
-10. [ ] Test Full: docker up → run auto-orchestrator 30min → verify self-edits/agent spawn → attempt_completion.
+10. [ ] Test Full: docker up → run auto-orchestrator 30min → verify self-edits/agent spawn → attempt_completion. (In progress)
+
+## Execution TODO (current run)
+
+- [x] Update scripts/quick-demo.sh
+- [x] Create scripts/auto-orchestrator.sh
+- [x] Update ada/prompts/self_improve.md
+- [x] Create tests/test_self_improve.py
+- [ ] Run validation commands
+- [ ] Mark TODO progress and finalize
 
 ## Next Action: scripts/quick-demo.sh update (step 6).
 **Run after each step**: docker compose down && docker compose up -d && docker compose ps (verify services). Test /health endpoints.

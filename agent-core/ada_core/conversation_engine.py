@@ -7,9 +7,11 @@ from typing import Any, List, Optional
 
 import requests
 
+from ada_core.agent_manager import get_agent_skills
 from ada_core.reasoning_engine import reason_about, review_single_file, review_project, run_with_skill
 from ada_core.research_engine import web_research_topic
 from ada_core.skills import SKILL_REGISTRY
+from ada_core.tools import make_dir, write_file
 
 _ollama_base = (os.getenv("OLLAMA_URL") or "http://localhost:11434/api/generate").strip().rstrip("/")
 OLLAMA_CHAT_URL = _ollama_base.replace("/api/generate", "/api/chat") if "/api/generate" in _ollama_base else _ollama_base + "/api/chat"
@@ -77,10 +79,12 @@ class ConversationEngine:
         user_message: str,
         history: Optional[List[dict]] = None,
         context: Optional[str] = None,
+        agent_type: Optional[str] = None,
     ) -> str:
         """
         Return ADA's response. On failure returns a safe message.
         history: list of {"role": "user"|"assistant", "content": "..."}
+        agent_type: optional workspace agent (developer, business, research, general). Loads only that agent's skills.
         """
         if not user_message or not user_message.strip():
             return "I didn't catch that. Could you say more?"
@@ -96,17 +100,32 @@ class ConversationEngine:
             path = user_message.strip()[len("/review "):].strip()
             return self._handle_code_review(path)
 
+        if msg_lower.startswith("/create "):
+            args = user_message.strip()[len("/create "):].strip()
+            return self._handle_file_creation(args)
+
         if msg_lower.startswith("/skill "):
             parts = user_message.strip().split(" ", 2)
             if len(parts) < 3:
                 return "Usage: `/skill <skill_name> <your prompt>`"
-            return self._handle_generic_skill(parts[1], parts[2])
+            return self._handle_generic_skill(parts[1], parts[2], agent_type=agent_type)
 
         if msg_lower == "/skills":
+            # If agent_type set, show only this agent's skills
+            if agent_type:
+                skills = get_agent_skills(agent_type)
+                available = ", ".join(s for s in skills if s in SKILL_REGISTRY) or "none"
+                return f"Skills for this workspace ({agent_type}): {available}\n\nUse them with `/skill <name> <prompt>`"
             available = ", ".join(SKILL_REGISTRY.keys())
             return f"Available skills: {available}\n\nUse them with `/skill <name> <prompt>`"
 
         system = self.system_prompt
+        # v3: inject agent-specific skills into system prompt so only those are in scope
+        if agent_type:
+            agent_skills = get_agent_skills(agent_type)
+            valid_skills = [s for s in agent_skills if s in SKILL_REGISTRY]
+            if valid_skills:
+                system = system + "\n\nYou are in the " + (agent_type or "general") + " workspace. Your available skills for this context: " + ", ".join(valid_skills) + ". Use /skill <name> <prompt> or the relevant slash commands."
         if context:
             system = system + "\n\nContext:\n" + str(context)[:2000]
 
@@ -150,11 +169,12 @@ class ConversationEngine:
         user_message: str,
         history: Optional[List[dict]] = None,
         context: Optional[str] = None,
+        agent_type: Optional[str] = None,
     ) -> str:
-        """Same as respond() but uses structured format (Análisis, Propuesta, Riesgos, Siguiente paso)."""
+        """Same as respond() but uses structured format (Analysis, Proposal, Risks, Next Step)."""
         system = (self.system_prompt + "\n\n" + ADA_STRUCTURED_RESPONSE_FORMAT).strip()
         engine = ConversationEngine(system_prompt=system)
-        return engine.respond(user_message, history=history, context=context)
+        return engine.respond(user_message, history=history, context=context, agent_type=agent_type)
 
     # --- Internal Skill Handlers ---
     
@@ -205,14 +225,64 @@ class ConversationEngine:
             
         return "Invalid path format."
 
-    def _handle_generic_skill(self, skill_name: str, prompt: str) -> str:
-        """Invokes a generic skill persona for reasoning."""
+    def _handle_generic_skill(self, skill_name: str, prompt: str, agent_type: Optional[str] = None) -> str:
+        """Invokes a generic skill persona for reasoning. If agent_type is set, only that agent's skills are allowed."""
         skill_name = skill_name.lower().strip()
         if skill_name not in SKILL_REGISTRY:
-            available = ", ".join(SKILL_REGISTRY.keys())
-            return f"Skill '{skill_name}' not found. Available skills: {available}"
-            
+            available = ", ".join(get_agent_skills(agent_type) if agent_type else SKILL_REGISTRY.keys())
+            return f"Skill '{skill_name}' not found. Available in this workspace: {available}"
+        if agent_type:
+            allowed = get_agent_skills(agent_type)
+            if skill_name not in allowed:
+                return f"Skill '{skill_name}' is not available in the {agent_type} workspace. Available: {', '.join(s for s in allowed if s in SKILL_REGISTRY)}."
         result = run_with_skill(skill_name, prompt)
         return result if result else "ADA was unable to process this skill request."
+
+    def _handle_file_creation(self, args: str) -> str:
+        """
+        Parses args as '<path> <description>' and uses CodingSkill to create a file.
+        Example: /create /dockers/tiendapet/index.html Landing page for pets
+        """
+        parts = args.split(" ", 1)
+        if len(parts) < 2:
+            return "Usage: `/create <path> <description>`"
+            
+        target_path = parts[0].strip()
+        description = parts[1].strip()
+        
+        # Path Mapping: Handle the host-to-container mapping for the user
+        if target_path.startswith("/Volumes/Datos/dockers/"):
+            target_path = target_path.replace("/Volumes/Datos/dockers/", "/dockers/")
+        elif not target_path.startswith("/"):
+            # If relative, assume /dockers as base for new projects
+            target_path = os.path.join("/dockers", target_path)
+
+        prompt = (
+            f"Generate the full source code for the following file: {target_path}\n"
+            f"Description: {description}\n"
+            "Return ONLY the code, no markdown blocks, no explanations. Just the raw code content."
+        )
+        
+        code_content = run_with_skill("coding", prompt)
+        
+        if not code_content:
+            return "Failed to generate code content for creation."
+            
+        # Clean up in case the LLM ignored "raw code" instruction
+        if code_content.startswith("```"):
+            lines = code_content.split("\n")
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+            code_content = "\n".join(lines).strip()
+
+        write_result = write_file(target_path, code_content)
+        
+        if "successfully" in write_result:
+            return f"✅ **File created!**\nPath: `{target_path}`\n\nContent preview:\n```html\n{code_content[:200]}...\n```"
+        else:
+            return f"❌ **Creation failed:** {write_result}"
+
 
 

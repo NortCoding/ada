@@ -659,3 +659,76 @@ class MemoryManager:
                 conn.close()
             except Exception:
                 pass
+
+    # --- ADA v3: knowledge_base (web research results) ---
+    @staticmethod
+    def add_knowledge(topic: str, source_url: str = "", summary: str = "") -> bool:
+        """Store a knowledge base entry (e.g. from web research). Returns False on failure."""
+        conn = _get_conn()
+        if not conn:
+            return False
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO ada_core.knowledge_base (topic, source_url, summary)
+                    VALUES (%s, %s, %s)
+                    """,
+                    ((topic or "")[:512], (source_url or "")[:2048], (summary or "")[:10000]),
+                )
+                conn.commit()
+            return True
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            return False
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def get_knowledge_by_topic(topic: Optional[str] = None, limit: int = 50) -> List[dict]:
+        """Return knowledge base entries, optionally filtered by topic. Never raises."""
+        conn = _get_conn()
+        if not conn:
+            return []
+        try:
+            with conn.cursor() as cur:
+                if topic:
+                    cur.execute(
+                        """
+                        SELECT id, topic, source_url, summary, created_at
+                        FROM ada_core.knowledge_base WHERE topic ILIKE %s ORDER BY created_at DESC LIMIT %s
+                        """,
+                        (f"%{topic}%", limit),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT id, topic, source_url, summary, created_at
+                        FROM ada_core.knowledge_base ORDER BY created_at DESC LIMIT %s
+                        """,
+                        (limit,),
+                    )
+                rows = cur.fetchall()
+            return [
+                {
+                    "id": r[0],
+                    "topic": r[1],
+                    "source_url": r[2],
+                    "summary": r[3],
+                    "created_at": str(r[4]) if r[4] else None,
+                }
+                for r in rows
+            ]
+        except Exception:
+            return []
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass

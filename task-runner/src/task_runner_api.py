@@ -8,12 +8,13 @@ import os
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from sandbox import execute_bash, WORKSPACE_DIR
 
 app = FastAPI(title="A.D.A Task Runner", version="0.1.0")
 
 LOG_URL = os.getenv("LOG_URL", "http://logging-system:3006/log")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
-SANDBOX_MODE = os.getenv("SANDBOX_MODE", "").lower() in ("1", "true", "yes")
+SANDBOX_MODE = False  # Disabled for production execution
 
 
 class TaskRequest(BaseModel):
@@ -38,8 +39,23 @@ def execute_task(task: TaskRequest):
                 "would_execute": {"task_name": task.task_name, "details": task.details},
             }
         else:
-            # Lógica real acotada; por ahora ejecución simulada
-            result = {"status": "success", "details": task.details}
+            # Lógica real acotada
+            if task.task_name == "bash_command":
+                cmd = task.details.get("command")
+                if not cmd:
+                    return {"status": "failed", "error": "El comando bash no fue proporcionado en 'details.command'."}
+
+                timeout = task.details.get("timeout_seconds", 30)
+                exec_result = execute_bash(cmd, timeout_seconds=timeout)
+                
+                result = {
+                    "status": "success" if exec_result["success"] else "failed",
+                    "details": exec_result,
+                    "workspace": WORKSPACE_DIR
+                }
+            else:
+                # Simular otras tareas por ahora
+                result = {"status": "success", "message": "Tarea simulada (no es bash_command)", "details": task.details}
 
         # Logging después de ejecutar (blocking ack)
         log_payload = {

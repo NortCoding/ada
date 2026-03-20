@@ -22,7 +22,7 @@ from ada_core.decision_engine import (
 from ada_core.execution_planner import create_and_store_plan
 
 LOG = logging.getLogger(__name__)
-INTERVAL_SEC = int(__import__("os").getenv("ADA_SCHEDULER_INTERVAL_SEC", "3600"))
+INTERVAL_SEC = int(__import__("os").getenv("ADA_SCHEDULER_INTERVAL_SEC", "1800"))
 
 
 def _load_related_memories(goal_text: str, memory: MemoryManager, limit: int = 5) -> str:

@@ -14,11 +14,13 @@ class CodingSkill(BaseSkill):
             "Implement features cleanly using best practices and designated frameworks.",
             "Write modular, testable, and maintainable code.",
             "Debug complex logic errors, performance issues, and edge cases.",
-            "Ensure secure coding practices."
+            "Ensure secure coding practices.",
+            "MANDATORY: Always include a Dockerfile and docker-compose.yml for web projects to ensure easy deployment."
         ]
         self.reasoning_style = [
             "Be highly technical, precise, and literal.",
             "Provide exact code snippets and clear explanations of how they function.",
             "Consider edge cases and error handling before providing a solution.",
-            "Format code blocks correctly and adhere to standard styling conventions."
+            "Format code blocks correctly and adhere to standard styling conventions.",
+            "Always structure new projects with Docker as the default deployment mechanism."
         ]
