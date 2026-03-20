@@ -1,0 +1,58 @@
+{
+  "stage_read": {
+    "root": "/Volumes/Datos/dockers/ADA",
+    "number_of_files": 1758,
+    "file_types": {
+      ".py": 662,
+      ".md": 542,
+      ".js": 284,
+      "<no_ext>": 63,
+      ".txt": 27,
+      ".h": 27,
+      ".sh": 20,
+      ".cpp": 15,
+      ".typed": 14,
+      ".exe": 13,
+      ".hpp": 13,
+      ".css": 11,
+      ".sql": 10,
+      ".html": 8,
+      ".ps1": 7,
+      ".json": 6,
+      ".ts": 4,
+      ".so": 3,
+      ".jsx": 3,
+      ".yml": 2,
+      ".8": 2,
+      ".ttf": 2,
+      ".svg": 2,
+      ".tmpl": 2,
+      ".obj": 2,
+      ".asm": 2,
+      ".env": 1,
+      ".example": 1,
+      ".cfg": 1,
+      ".fish": 1,
+      ".csh": 1,
+      ".mjs": 1,
+      ".png": 1,
+      ".pem": 1,
+      ".xml": 1,
+      ".cmd": 1,
+      ".c": 1,
+      ".psf": 1
+    }
+  },
+  "stage_run": {
+    "command": "python3 -c \"print('RUN_OK')\"",
+    "returncode": 0,
+    "stdout": "RUN_OK",
+    "stderr": ""
+  },
+  "stage_debug": {
+    "command": "python3 -c \"import sys; sys.exit(2)\"",
+    "returncode": 2,
+    "stdout": "",
+    "stderr": ""
+  }
+}

@@ -8,7 +8,8 @@ from bs4 import BeautifulSoup
 def read_webpage(url: str, max_chars: int = 5000) -> str:
     """
     Downloads a webpage and extracts text using BeautifulSoup.
-    Limits the return size to avoid flooding LLM context windows.
+    Limits the return size (max_chars) to avoid flooding LLM context and prevent overload.
+    Fase 3: limit scraping — callers should also limit number of pages and add delays.
     """
     if not url or not url.startswith("http"):
         return "Error: Invalid URL."

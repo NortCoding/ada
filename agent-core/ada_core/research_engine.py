@@ -1,8 +1,9 @@
 """
-ADA v2.5 — Research engine.
-Investiga internamente: analizar metas, proponer estrategias, comparar opciones.
-Por ahora solo análisis interno (sin búsqueda web). Nunca lanza excepciones.
+ADA v2.5 / v3 — Research engine.
+Investiga internamente y en web: metas, estrategias, búsqueda DuckDuckGo, resumen con Ollama.
+Guarda resultados en knowledge_base (v3). Nunca lanza excepciones.
 """
+import time
 from typing import List, Optional
 
 from ada_core.reasoning_engine import reason_about, run_with_skill
@@ -51,37 +52,46 @@ def evaluate_tools(tool_names: List[str], for_goal: str = "") -> str:
     return reason_about(prompt).strip()
 
 
-def web_research_topic(query: str, max_results: int = 3, max_pages_to_read: int = 2) -> List[dict]:
+def web_research_topic(
+    query: str,
+    max_results: int = 3,
+    max_pages_to_read: int = 2,
+    store_in_knowledge_base: bool = True,
+) -> List[dict]:
     """
     Realiza una investigación en internet sobre un tema específico.
-    Busca, descarga páginas web verdaderas, usa Ollama para resumirlas, y
-    devuelve las fuentes.
+    - Busca en DuckDuckGo (HTML).
+    - Descarga y extrae texto con BeautifulSoup (límite por página y por cantidad).
+    - Resume con Ollama (skill web_research).
+    - Opcionalmente guarda cada resultado en knowledge_base (v3).
+    Limita scraping: máximo max_pages_to_read páginas y pausa de 1s entre lecturas.
     """
     if not query or not query.strip():
         return []
 
     # 1. Buscar en DuckDuckGo
     results = search_web(query, max_results=max_results)
-    if not results or "error" in results[0]:
+    if not results or (results and "error" in results[0]):
         return [{"error": results[0].get("error", "Unknown search error")}] if results else []
 
     knowledge = []
     pages_read = 0
 
-    # 2. Leer y resumir
     for r in results:
         if pages_read >= max_pages_to_read:
             break
-            
         url = r.get("url")
         if not url:
             continue
 
-        raw_content = read_webpage(url)
+        # Pausa entre peticiones para no sobrecargar (Fase 3: limit scraping)
+        if pages_read > 0:
+            time.sleep(1)
+
+        raw_content = read_webpage(url, max_chars=5000)
         if raw_content.startswith("Error"):
             continue
 
-        # 3. Resumir contenido usando el cerebro local (Skill Investigador Web)
         prompt = (
             f"Please summarize the key points of the following web page content "
             f"contextualized for this subject: '{query}'.\n\nCONTENT:\n{raw_content}"
@@ -89,11 +99,18 @@ def web_research_topic(query: str, max_results: int = 3, max_pages_to_read: int 
         summary = run_with_skill("web_research", prompt)
 
         if summary:
-            knowledge.append({
+            item = {
                 "source_url": url,
                 "title": r.get("title", "Unknown Title"),
-                "summary": summary
-            })
+                "summary": summary,
+            }
+            knowledge.append(item)
+            if store_in_knowledge_base:
+                try:
+                    from ada_core.memory_manager import MemoryManager
+                    MemoryManager.add_knowledge(topic=query.strip(), source_url=url, summary=summary)
+                except Exception:
+                    pass
             pages_read += 1
 
     return knowledge

@@ -59,3 +59,27 @@ CREATE TABLE IF NOT EXISTS ada_core.opportunities (
 CREATE INDEX IF NOT EXISTS idx_ada_core_opportunities_status ON ada_core.opportunities (status);
 CREATE INDEX IF NOT EXISTS idx_ada_core_opportunities_score ON ada_core.opportunities (score DESC);
 CREATE INDEX IF NOT EXISTS idx_ada_core_opportunities_goal_id ON ada_core.opportunities (goal_id);
+
+-- ADA v3: agent proposals (human approval required; agents only proposed)
+CREATE TABLE IF NOT EXISTS ada_core.agent_proposals (
+    id SERIAL PRIMARY KEY,
+    agent_name VARCHAR(255) NOT NULL,
+    purpose TEXT,
+    suggested_skills TEXT,
+    status VARCHAR(64) NOT NULL DEFAULT 'pending',
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ada_core_agent_proposals_status ON ada_core.agent_proposals (status);
+
+-- ADA v3: knowledge base (web research results storage)
+CREATE TABLE IF NOT EXISTS ada_core.knowledge_base (
+    id SERIAL PRIMARY KEY,
+    topic VARCHAR(512) NOT NULL,
+    source_url TEXT,
+    summary TEXT,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ada_core_knowledge_base_topic ON ada_core.knowledge_base (topic);
+CREATE INDEX IF NOT EXISTS idx_ada_core_knowledge_base_created_at ON ada_core.knowledge_base (created_at DESC);

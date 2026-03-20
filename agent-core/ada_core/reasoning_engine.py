@@ -84,7 +84,9 @@ def run_with_skill(skill_name: str, prompt: str, context: Optional[str] = None, 
 
 def review_single_file(file_path: str) -> dict:
     """
-    Reads a single code file and asks ADA (Ollama) to review it using the Code Review persona.
+    Reads a single code file and asks ADA (Ollama) to review it using the Code Review skill.
+    Returns structured improvement suggestions (Analysis, Suggested Fix, Reason).
+    Never modifies files automatically.
     """
     code = read_code_file(file_path)
     if not code or code.startswith("Error"):
@@ -102,8 +104,9 @@ def review_single_file(file_path: str) -> dict:
 
 def review_project(project_path: str, max_files: int = 5) -> List[dict]:
     """
-    Scans the project directory (excluding ignored folders), and reviews each file up to max_files.
-    Returns a list of dictionaries with suggested fixes.
+    Scans the project directory (scan_project), reviews each file (read_code_file + code_review skill).
+    Returns a list of structured improvement suggestions per file.
+    Never modifies files automatically; only suggests.
     """
     files = scan_project(project_path, max_files=max_files)
     suggestions = []

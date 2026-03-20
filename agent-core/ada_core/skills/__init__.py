@@ -9,6 +9,9 @@ from ada_core.skills.strategy_skill import StrategySkill
 from ada_core.skills.web_research_skill import WebResearchSkill
 from ada_core.skills.code_review_skill import CodeReviewSkill
 
+from ada_core.skills.web_automation_skill import WebAutomationSkill
+from ada_core.skills.file_system_skill import FileSystemSkill
+
 SKILL_REGISTRY = {
     "architecture": ArchitectureSkill,
     "research": ResearchSkill,
@@ -17,6 +20,8 @@ SKILL_REGISTRY = {
     "learning": LearningSkill,
     "web_research": WebResearchSkill,
     "code_review": CodeReviewSkill,
+    "web_automation": WebAutomationSkill,
+    "file_system": FileSystemSkill,
 }
 
 def get_skill_system_prompt(skill_name: str) -> str:
