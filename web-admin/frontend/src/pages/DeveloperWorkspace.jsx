@@ -4,10 +4,8 @@ import FileExplorer from '../components/FileExplorer'
 import CodeViewer from '../components/CodeViewer'
 import { api } from '../api/client'
 import TaskList from '../components/tasks/TaskList'
-import PendingApprovalsPanel from '../components/approvals/PendingApprovalsPanel'
 import RecentActivityLog from '../components/activity/RecentActivityLog'
 import { useTaskQueue } from '../hooks/useTaskQueue'
-import { useApprovals } from '../hooks/useApprovals'
 
 export default function DeveloperWorkspace() {
   const [theme, setTheme] = useState(() => {
@@ -43,8 +41,16 @@ export default function DeveloperWorkspace() {
   const [selectedFileLoading, setSelectedFileLoading] = useState(false)
 
   const { tasks, stats, createTask, startTask, completeTask, failTask } = useTaskQueue()
-  const { approvals, pending, requestApproval, approve, reject, markExecuting, markDone, markError } = useApprovals()
   const [localActivity, setLocalActivity] = useState([])
+  const [pendingPlan, setPendingPlan] = useState(null)
+  const [executingPlan, setExecutingPlan] = useState(false)
+  const [pendingPlanError, setPendingPlanError] = useState(null)
+
+  const discardPendingPlan = () => {
+    setPendingPlan(null)
+    setPendingPlanError(null)
+    pushActivity('plan descartado por el usuario')
+  }
 
   const pushActivity = useCallback((text) => {
     const ts = new Date().toISOString()
@@ -105,16 +111,29 @@ export default function DeveloperWorkspace() {
     if (imageToSend) payload.image_base64 = imageToSend
 
     api('/chat', { method: 'POST', body: JSON.stringify(payload) })
-      .then((res) => setChatHistory((h) => [...h, { role: 'ada', text: res.response, brain: res.brain }]))
-      .catch((e) => setChatHistory((h) => [...h, { role: 'ada', text: `Error: ${e.message}` }]))
+      .then((res) => {
+        setChatHistory((h) => [...h, { role: 'ada', text: res.response, brain: res.brain }])
+        if (res.status === 'pending_plan' && Array.isArray(res.pending_plan)) {
+          setPendingPlan(res.pending_plan)
+          setPendingPlanError(null)
+        } else {
+          setPendingPlan(null)
+          setPendingPlanError(null)
+        }
+      })
+      .catch((e) => {
+        setPendingPlan(null)
+        setPendingPlanError(e.message || 'Error')
+        setChatHistory((h) => [...h, { role: 'ada', text: `Error: ${e.message}` }])
+      })
       .finally(() => setLoading(false))
   }
 
   const adaStatus = useMemo(() => {
-    if (pending.length) return 'waiting approval'
+    if (pendingPlan) return 'waiting approval'
     if (stats.running) return 'running'
     return 'idle'
-  }, [pending.length, stats.running])
+  }, [pendingPlan, stats.running])
 
   const createQuickTask = (kind) => {
     if (kind === 'analyze') {
@@ -132,83 +151,45 @@ export default function DeveloperWorkspace() {
       completeTask(t.id, 'Prepared chat instruction')
       return
     }
-    if (kind === 'run_command') {
-      const cmd = 'ls'
-      const t = createTask({ type: 'run_command', title: `Run command: ${cmd}`, input: { command: cmd } })
-      requestApproval({
-        kind: 'run_command',
-        title: `Execute command: ${cmd}`,
-        payload: { command: cmd },
-        preview: cmd,
-      })
-      startTask(t.id)
-      completeTask(t.id, 'Queued for approval')
-      return
-    }
-    if (kind === 'create_file') {
-      const path = 'ADA/test-ui.txt'
-      const content = `created from UI at ${new Date().toISOString()}\n`
-      const t = createTask({ type: 'create_file', title: `Create file: ${path}`, input: { path } })
-      requestApproval({
-        kind: 'create_file',
-        title: `Create file: ${path}`,
-        payload: { path, content },
-        preview: { path, contentPreview: content.slice(0, 200) },
-      })
-      startTask(t.id)
-      completeTask(t.id, 'Queued for approval')
-      return
-    }
-    if (kind === 'apply_patch') {
-      const path = 'ADA/test-ui.txt'
-      const newContent = `patched from UI at ${new Date().toISOString()}\n`
-      const t = createTask({ type: 'apply_patch', title: `Apply patch: ${path}`, input: { path } })
-      requestApproval({
-        kind: 'apply_patch',
-        title: `Apply patch: ${path}`,
-        payload: { path, new_content: newContent },
-        preview: { path, note: 'overwrite with new_content', newContentPreview: newContent.slice(0, 200) },
-      })
-      startTask(t.id)
-      completeTask(t.id, 'Queued for approval')
+    if (kind === 'demo_landing') {
+      const msg = [
+        'Crea una landing page estática para presentar ADA como asistente de desarrollo.',
+        'Escribe los archivos bajo dockers/ada-landing-demo/ (index.html y styles.css).',
+        'Incluye hero con título, 3 beneficios y un CTA. Estilo sobrio y legible.',
+        'Si hace falta, primero LIST_DIR: dockers; luego usa WRITE_FILE con END_FILE por archivo.',
+        'Si quieres servir la página localmente con un comando, incluye RUN_COMMAND al final del plan (aprobación aparte).',
+      ].join(' ')
+      const t = createTask({ type: 'chat_instruction', title: 'Demo: landing ADA', input: { message: msg } })
+      setChatMessage(msg)
+      if (chatInputRef.current) chatInputRef.current.textContent = msg
+      completeTask(t.id, 'Demo prompt listo en el chat')
       return
     }
   }
 
-  const onApprove = (approvalId) => {
-    const a = approvals.find((x) => x.id === approvalId)
-    if (!a) return
-    const actionType =
-      a.kind === 'create_file' ? 'create_file' :
-      a.kind === 'run_command' ? 'run_command' :
-      a.kind === 'apply_patch' ? 'apply_patch' :
-      null
-    if (!actionType) return
+  const executePendingPlan = () => {
+    if (!pendingPlan || executingPlan) return
+    setExecutingPlan(true)
+    setPendingPlanError(null)
 
-    markExecuting(approvalId)
-    const t = createTask({ type: 'approval_execute', title: `Execute approval: ${a.kind}`, input: { approvalId, actionType } })
+    const t = createTask({ type: 'execute_plan', title: 'Ejecutar plan aprobado', input: { n_actions: pendingPlan.length } })
     startTask(t.id)
 
-    api('/approve/execute', { method: 'POST', body: JSON.stringify({ action_type: actionType, payload: a.payload || {} }) })
+    api('/execute_plan', { method: 'POST', body: JSON.stringify({ plan: pendingPlan }) })
       .then((res) => {
-        approve(approvalId)
-        markDone(approvalId, res)
-        completeTask(t.id, res)
-        const target = (res && (res.target || (res.verification && res.verification.full_path))) || ''
-        const ok = res && res.success === true
-        pushActivity(`approved+executed: ${a.kind}${target ? ` · ${target}` : ''} · ${ok ? 'ok' : 'error'}`)
+        const results = Array.isArray(res?.results) ? res.results : []
+        const joined = results.length ? results.join('\n') : '(sin resultados)'
+        setChatHistory((h) => [...h, { role: 'ada', text: `Resultado del plan:\n${joined}`, brain: res?.status || 'done' }])
+        completeTask(t.id, res?.status || 'done')
+        setPendingPlan(null)
+        pushActivity(`plan ejecutado · ${res?.status || 'done'}`)
       })
       .catch((e) => {
-        markError(approvalId, e.message)
-        failTask(t.id, e.message)
-        pushActivity(`approved+executed: ${a.kind} · error · ${e.message}`)
+        setPendingPlanError(e?.message || 'Error al ejecutar plan')
+        failTask(t.id, e?.message || 'Error al ejecutar plan')
+        pushActivity(`plan ejecutado · error · ${e?.message || 'Error'}`)
       })
-  }
-
-  const onReject = (approvalId) => {
-    reject(approvalId)
-    const t = createTask({ type: 'approval', title: 'Approval rejected', input: { approvalId } })
-    completeTask(t.id, 'Rejected')
+      .finally(() => setExecutingPlan(false))
   }
 
   return (
@@ -262,21 +243,39 @@ export default function DeveloperWorkspace() {
           <div>
             <h3 style={{ margin: 0 }}>⚡ Quick actions</h3>
             <div style={{ fontSize: '0.85rem', color: 'var(--subtle)', marginTop: 6 }}>
-              Estas acciones crean tasks visibles. Ejecutar requiere aprobación.
+              Atajos para preparar instrucciones en el chat. Si ADA propone un plan delicado, se pedirá aprobación.
             </div>
           </div>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
             <button className="secondary" onClick={() => createQuickTask('analyze')}>Analyze project</button>
             <button className="secondary" onClick={() => createQuickTask('fix_error')}>Fix error (example)</button>
-            <button className="secondary" onClick={() => createQuickTask('run_command')}>Run command (requires approval)</button>
-            <button className="secondary" onClick={() => createQuickTask('create_file')}>Create file (requires approval)</button>
-            <button className="secondary" onClick={() => createQuickTask('apply_patch')}>Apply patch (requires approval)</button>
+            <button className="secondary" onClick={() => createQuickTask('demo_landing')}>Demo: landing ADA (prompt)</button>
           </div>
 
           <div className="glass-card" style={{ padding: '1rem' }}>
-            <h4 style={{ marginTop: 0 }}>⏳ Pending approvals</h4>
-            <PendingApprovalsPanel pending={pending} onApprove={onApprove} onReject={onReject} />
+            <h4 style={{ marginTop: 0 }}>⏳ Plan pendiente de aprobación</h4>
+            {pendingPlan ? (
+              <>
+                <div style={{ fontSize: '0.85rem', color: 'var(--subtle)', marginTop: 6 }}>
+                  Acciones: {pendingPlan.length}
+                </div>
+                <pre style={{ marginTop: 10, fontSize: '0.75rem', whiteSpace: 'pre-wrap', background: 'rgba(0,0,0,0.05)', padding: 10, borderRadius: 10 }}>
+                  {pendingPlan.map((a, i) => `${i + 1}. ${(a && a.type) || 'unknown'}`).join('\n')}
+                </pre>
+                {pendingPlanError && <div style={{ color: 'var(--danger)', fontSize: '0.85rem' }}>{pendingPlanError}</div>}
+                <div style={{ display: 'flex', gap: 10, marginTop: 10, flexWrap: 'wrap' }}>
+                  <button disabled={executingPlan} onClick={executePendingPlan} style={{ padding: '6px 10px', fontSize: '0.85rem' }}>
+                    {executingPlan ? 'Ejecutando…' : 'Ejecutar plan'}
+                  </button>
+                  <button type="button" className="secondary" disabled={executingPlan} onClick={discardPendingPlan} style={{ padding: '6px 10px', fontSize: '0.85rem' }}>
+                    Descartar plan
+                  </button>
+                </div>
+              </>
+            ) : (
+              <div style={{ color: 'var(--subtle)', fontSize: '0.9rem' }}>No hay plan pendiente.</div>
+            )}
           </div>
 
           <div className="glass-card" style={{ padding: '1rem' }}>

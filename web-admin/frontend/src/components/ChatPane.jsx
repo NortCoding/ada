@@ -84,7 +84,7 @@ export default function ChatPane({
       <header className="pane-header">
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
           <div className="avatar" style={{ width: 32, height: 32, fontSize: '1rem', background: 'var(--accent)', color: '#1a1a1a', display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '50%', fontWeight: 'bold' }}>A</div>
-          <h2 style={{ margin: 0, fontSize: '1.2rem', fontWeight: 700 }}>ADA <span style={{ fontSize: '0.8rem', opacity: 0.7, fontWeight: 400 }}>Socio Virtual</span></h2>
+          <h2 style={{ margin: 0, fontSize: '1.2rem', fontWeight: 700 }}>ADA <span style={{ fontSize: '0.8rem', opacity: 0.7, fontWeight: 400 }}>asistente de desarrollo</span></h2>
         </div>
         <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
           <button

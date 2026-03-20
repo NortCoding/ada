@@ -1,11 +1,15 @@
 """
-A.D.A — Agent Core (F4)
-Genera propuestas (con o sin LLM/Ollama), orquesta: simulación → policy → logging → task-runner.
+A.D.A — Agent Core (ADA v1)
+Asistente de desarrollo: chat, herramientas de workspace (lectura/escritura/listado/grep),
+planes con aprobación y ejecución controlada de comandos (allowlist + timeout).
+
+Rutas opcionales legacy (simulación, policy, task-runner) solo si están configuradas por entorno.
 """
 import json
 import os
 import re
 import subprocess
+import shlex
 import threading
 import time
 from collections import deque
@@ -38,14 +42,17 @@ from pydantic import BaseModel
 
 app = FastAPI(title="A.D.A Agent Core", version="0.4.0")
 
-# ADA v2 Minimal Core: start background scheduler (goals -> ideas every hour)
-try:
-    from ada_core.scheduler import start_scheduler
-    @app.on_event("startup")
-    def _start_ada_v2_scheduler():
-        start_scheduler()
-except ImportError:
-    pass
+# ADA v2 Minimal Core: scheduler (goals -> ideas every hour)
+# ADA v1: deshabilitado por defecto para evitar autonomía/scheduler fuera de foco.
+if os.getenv("ADA_ENABLE_SCHEDULER", "").strip().lower() in ("1", "true", "yes"):
+    try:
+        from ada_core.scheduler import start_scheduler
+
+        @app.on_event("startup")
+        def _start_ada_v2_scheduler():
+            start_scheduler()
+    except ImportError:
+        pass
 
 from ada_core.conversation_engine import ConversationEngine
 
@@ -81,17 +88,21 @@ try:
 except ImportError:
     moltbot = None
 
-ADA_SYSTEM_PROMPT = """Eres A.D.A (Agente Digital Autónomo).
+ADA_SYSTEM_PROMPT = """ADA es un asistente experto en desarrollo de software.
 
-Tu única regla: aprender y crecer. Tu única meta: sobrevivir, aprender y crecer.
+Tu misión es ayudar al usuario a:
+- analizar proyectos reales,
+- investigar documentación técnica en internet cuando haga falta,
+- crear y modificar aplicaciones en el workspace real,
+- ejecutar comandos permitidos y corregir errores.
 
-Cómo te presentas: tu cerebro por defecto es Ollama (gratis, local); utilizas la memoria (memory-db) y el ledger (estado financiero) para aprender y mejorar. Herramientas: Ollama, n8n local, scripts y comandos permitidos. El cerebro avanzado (Gemini) es de pago: úsalo solo cuando el usuario lo pida explícitamente o cuando realmente haga falta más capacidad (ej. análisis complejo, visión). Prioridad: usar al máximo lo local y gratuito; Gemini solo si se necesita más.
+Reglas de ejecución (ADA v1):
+- Cuando necesites acciones delicadas (por ejemplo `RUN_COMMAND`, borrados o cambios relevantes), primero PROPON un plan usando las herramientas en formato de líneas (READ_FILE / WRITE_FILE / LIST_DIR / GREP / RUN_COMMAND / DELETE_*). No ejecutes nada hasta que el usuario apruebe el plan.
+- Prioriza soluciones verificables. Reporta evidencia real: rutas de archivos, stdout/stderr, exit_code y resultados de herramientas.
+- No inventes estados inexistentes: usa LIST_DIR/READ_FILE/GREP para confirmar antes de cambiar.
 
-- Puedes hacer todo lo que necesites para aprender y crecer: leer y escribir archivos, ejecutar comandos permitidos, proponer planes, usar herramientas, explorar el proyecto, probar ideas. No pidas permiso para actuar; actúa y reporta.
-- La única restricción es el dinero: gastos, compras o desembolsos pueden requerir aprobación humana según la política del proyecto. Todo lo demás está en tu mano.
-- Usa la memoria (memory-db), el ledger (para saber estado financiero), task-runner cuando haya tareas aprobadas, y las herramientas de archivos y comandos para aprender y mejorar.
-- Si un paso requiere a un humano (ej. registro en una plataforma sin API), indícalo y notifica; no bloquees el resto por eso.
-- Tono: directo, útil, enfocado en aprender y en resultados. No repitas preguntas de confirmación; continúa tú sola.
+Límites:
+- No mezcles negocio/market/autonomía/scheduler en las respuestas.
 """
 
 # Instrucciones para que ADA use herramientas de archivos y sistema (se añaden al system si hay ADA_WORKSPACE o ADA_PROJECTS_ROOT).
@@ -101,6 +112,7 @@ Herramientas para interactuar con archivos y directorios. IMPORTANTE: usa siempr
 - Carpeta de prompts del proyecto: ada/prompts (lista con LIST_DIR: ada/prompts, lee con READ_FILE: ada/prompts/nombre.md).
 - Otras rutas: web-admin/frontend/src/App.jsx, agent-core/src/..., etc.
 - Carpeta de proyectos externos: prefijo dockers/ (ej. LIST_DIR: dockers, WRITE_FILE: dockers/mi-app/README.md).
+- Demo landing estática (recomendado): escribe bajo dockers/ada-landing-demo/ (p. ej. index.html, styles.css) para poder abrirlos desde el explorador del panel.
 - LEER archivo: READ_FILE: ruta/archivo (siempre ruta relativa, ej. ada/prompts/archivo.md).
 - ESCRIBIR archivo: WRITE_FILE: ruta/archivo y en las siguientes líneas el contenido completo; termina con END_FILE en una línea sola.
 - LISTAR directorio: LIST_DIR: ruta (ruta puede ser . , dockers , dockers/mi-proyecto , etc.).
@@ -315,7 +327,7 @@ def _get_requested_resources() -> dict:
 
 
 # Claves de memoria que se piden en una sola llamada para el chat (respuesta más rápida)
-_CHAT_MEMORY_KEYS = "first_plan,weekly_plan,requested_hardware_resources"
+_CHAT_MEMORY_KEYS = "requested_hardware_resources"
 # Límite de caracteres del plan en el prompt para no inflar contexto y acelerar Ollama
 _PLAN_CONTEXT_MAX_CHARS = 700
 
@@ -332,7 +344,10 @@ def _invalidate_chat_context_cache() -> None:
 
 
 def _fetch_chat_context_parallel() -> Tuple[dict, dict]:
-    """Obtiene en paralelo: (1) memoria (plan + recursos) y (2) balance del ledger. Usa caché con TTL para más velocidad."""
+    """Obtiene contexto para chat usando caché con TTL.
+
+    ADA v1: solo memoria (recursos solicitados). No se consulta ledger ni se depende de servicios de negocio.
+    """
     now = time.time()
     with _chat_context_cache_lock:
         if _chat_context_cache:
@@ -343,27 +358,11 @@ def _fetch_chat_context_parallel() -> Tuple[dict, dict]:
                     _chat_context_cache.get("balance", {"income": 0, "can_use_paid_tools": False}),
                 )
     memory_result = {}
-    balance_data = {"income": 0, "can_use_paid_tools": False}
+    balance_data = {"income": 0, "can_use_paid_tools": False}  # legacy compat
 
-    def do_memory():
-        if not MEMORY_URL:
-            return {}
+    if MEMORY_URL:
         resp, code = _get(MEMORY_URL + "/get_many?keys=" + _CHAT_MEMORY_KEYS)
-        return resp if code == 200 and isinstance(resp, dict) else {}
-
-    def do_ledger():
-        if not LEDGER_URL:
-            return balance_data
-        resp, code = _get(LEDGER_URL + "/balance")
-        if code == 200 and isinstance(resp, dict):
-            return resp
-        return balance_data
-
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        f_mem = ex.submit(do_memory)
-        f_ledger = ex.submit(do_ledger)
-        memory_result = f_mem.result()
-        balance_data = f_ledger.result()
+        memory_result = resp if code == 200 and isinstance(resp, dict) else {}
     with _chat_context_cache_lock:
         _chat_context_cache.update({"memory": memory_result, "balance": balance_data, "ts": now})
     return memory_result, balance_data
@@ -731,36 +730,12 @@ def _chat_impl(req: ChatRequest):
     if message.lower().startswith("/exec ") or message.lower().startswith("/execute "):
         execution_mode = True
         message = message.split(" ", 1)[1].strip() if " " in message else ""
-    # Si el usuario pide explícitamente crear la oferta, ADA lo hace con autonomía
-    if any(k in message.lower() for k in ("crea la oferta", "crear primera oferta", "crea tu primera oferta", "ada crea la oferta", "que ada cree la oferta")):
-        out = _create_first_offer_impl()
-        return {"response": out.get("response", "Listo."), "status": out.get("status", "done")}
+    # Legacy: generación de negocio/ofertas deshabilitada en ADA v1.
     if use_ollama:
         try:
-            # Una sola ronda: memoria (plan + recursos) y ledger en paralelo para menor latencia
-            memory_dict, balance_data = _fetch_chat_context_parallel()
-            now = datetime.now(SYDNEY_TZ)
-            date_ctx = now.strftime("%Y-%m-%d")
-            time_ctx = now.strftime("%H:%M:%S Sydney")
-            can_paid = balance_data.get("can_use_paid_tools", False)
-            financial_context = (
-                f"\nFinanzas: ingresos={balance_data.get('income', 0)}, herramientas de pago={'SÍ' if can_paid else 'NO (solo gratuitas)'}."
-            )
-            if not can_paid:
-                financial_context += " Usa solo Ollama, n8n local, scripts, memory-db."
-            datetime_context = f" Fecha/hora Sydney: {date_ctx} {time_ctx}."
-            ada_email = os.getenv("ADA_EMAIL", "").strip()
-            registration_context = ""
-            if ada_email:
-                registration_context = (
-                    f" Correo de A.D.A para Gumroad y otras plataformas: {ada_email}. "
-                    "Las credenciales están en .env (ADA_EMAIL, ADA_EMAIL_PASSWORD); no hay GUMROAD_CREDENTIALS ni conexión con Ollama. "
-                    "Para entrar a Gumroad con esa cuenta: ./signup-helper/run.sh gumroad_login. Para registro nuevo: ./signup-helper/run.sh gumroad. URLs en /api/autonomous/register_platforms."
-                )
-            plan_context = _build_plan_context_from_memory(memory_dict)
-            if plan_context:
-                plan_context = " Plan que propones como socio para el primer ingreso (cuando pregunten qué plan tienes o por qué, explícale tu propuesta):" + plan_context
-            system_content = ADA_SYSTEM_PROMPT + financial_context + datetime_context + registration_context + plan_context
+            # ADA v1: solo memoria (recursos solicitados). Sin contexto de negocio/ledger.
+            memory_dict, _ = _fetch_chat_context_parallel()
+            system_content = ADA_SYSTEM_PROMPT
             if os.getenv("ADA_WORKSPACE", "").strip() or os.getenv("ADA_PROJECTS_ROOT", "").strip():
                 system_content += ADA_TOOLS_FILE_PROMPT
             # v3 strict execution mode: load dedicated prompt and enforce strict parsing (no free text execution)
@@ -774,7 +749,7 @@ def _chat_impl(req: ChatRequest):
             agent_type = getattr(req, "agent_type", None) or (req.agent_type if hasattr(req, "agent_type") else None)
             if agent_type:
                 from ada_core.agent_manager import get_agent_skills
-                skills = [s for s in get_agent_skills(agent_type) if s in ("coding", "code_review", "architecture", "strategy", "research", "web_research", "learning")]
+                skills = [s for s in get_agent_skills(agent_type) if s in ("coding", "code_review", "architecture", "research", "web_research")]
                 if skills:
                     system_content += "\n\nWorkspace: " + agent_type + ". Available skills: " + ", ".join(skills) + "."
 
@@ -1902,36 +1877,39 @@ def _do_run_command(cmd: str) -> Tuple[bool, str]:
     blocked = ("rm ", "sudo", "mkfs", "dd ", "chmod 777", "> /dev/", "curl | sh", "wget -O- | sh")
     if any(b in cmd for b in blocked):
         return False, "Comando bloqueado por seguridad."
-    try:
-        # Enviar comando a través del flujo de la arquitectura (simulación -> policy -> task-runner)
-        proposal = Proposal(
-            task_name="bash_command",
-            details={
-                "command": cmd,
-                "timeout_seconds": int(os.getenv("ADA_RUN_COMMAND_TIMEOUT", "60")),
-                "description": f"Ejecutar comando bash: {cmd}"
-            }
-        )
-        # route down to propose_task (execution is True to allow task-runner to handle it if policy approves)
-        result = propose_task(proposal, execute=True)
-        
-        task_res = result.get("task_result")
-        if task_res and task_res.get("status") == "success":
-            details = task_res.get("details", {})
-            out = details.get("stdout", "")
-            err = details.get("stderr", "")
-            if not details.get("success"):
-                return False, f"exit {details.get('exit_code', 1)}\nstdout: {out[:2000]}\nstderr: {err[:2000]}"
-            return True, (out or "(sin salida)")[:4000]
-        elif task_res and task_res.get("status") == "failed":
-             return False, str(task_res.get("error", "Error desconocido en task-runner"))
-        elif task_res and task_res.get("status") == "pending_approval":
-             return False, "El comando requiere aprobación manual (Policy Engine)."
-        else:
-             return False, f"Ejecución bloqueada o fallida: {result.get('status')} - {result.get('policy', {}).get('reason')}"
+    timeout_s = int(os.getenv("ADA_RUN_COMMAND_TIMEOUT", "60"))
+    workspace = (os.getenv("ADA_WORKSPACE") or "/workspace").rstrip("/") or "/workspace"
 
+    try:
+        args = shlex.split(cmd)
+        if args and args[0].lower() == "python":
+            # Normalización para evitar "python no encontrado" en algunas imágenes.
+            args[0] = "python3"
+
+        proc = subprocess.run(
+            args,
+            cwd=workspace,
+            timeout=timeout_s,
+            text=True,
+            capture_output=True,
+        )
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
+        out = (
+            f"exit_code: {proc.returncode}\n"
+            f"cwd: {workspace}\n"
+            f"stdout:\n{stdout}\n"
+            f"stderr:\n{stderr}\n"
+        )
+        # Cap de salida para evitar inflar el chat.
+        out = out[:12000]
+        return proc.returncode == 0, out
+    except subprocess.TimeoutExpired:
+        return False, f"timeout_after_s: {timeout_s}\ncmd: {cmd}"
+    except FileNotFoundError as e:
+        return False, f"command_not_found: {e}"
     except Exception as e:
-        return False, str(e)
+        return False, f"run_command_error: {e}"
 
 
 def _is_end_file_line(line: str) -> bool:

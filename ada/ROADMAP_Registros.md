@@ -331,3 +331,16 @@ Plantilla de entrada (para copiar y pegar):
     - Escritura/patch requieren `ENABLE_AGENT_FS=1`.
   - **Resultado verificable**:
     - Build frontend OK (`vite build`) y en UI aparecen approvals con estado + resultado/error tras ejecutar.
+
+---
+
+## TRACE DE ETAPAS (APPEND-ONLY) — HIT27
+
+- [2026-03-20] **HIT27: ADA v1 — poda de compose, agent-core y frontend; flujo plan → ejecución; demo landing documentada**.
+  - **Qué se hizo**:
+    - `docker-compose.yml` recortado al núcleo (postgres, memory_service, agent-core, chat_interface); servicios históricos movidos a `docker-compose.legacy.yml`.
+    - `agent-core`: encabezado y prompt de herramientas alineados a desarrollo; convención `dockers/ada-landing-demo/` para demo de landing.
+    - Frontend: solo workspace de desarrollo; plan pendiente (`pending_plan`) con **Ejecutar plan** / **Descartar plan**; atajo **Demo: landing ADA (prompt)**; proxy web-admin sin depender de capabilities/monitor/market para el camino v1.
+    - Documentación de demo: `docs/DEMO-LANDING-ADA.md`.
+  - **Resultado verificable**:
+    - `docker compose up -d` levanta solo el núcleo; UI en `http://localhost:8080` con flujo chat → (pending_plan) → execute_plan.

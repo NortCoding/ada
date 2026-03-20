@@ -1,13 +1,10 @@
 import React from 'react'
-import { useLocation } from 'react-router-dom'
 import Sidebar from './Sidebar'
 import TopStatusBar from './TopStatusBar'
 
 export default function AppShell({ children }) {
-  const location = useLocation()
-  const pathParts = location.pathname.split('/')
-  // /v2/developer -> developer
-  const workspaceKey = pathParts[2] || 'home'
+  // ADA v1: solo workspace de desarrollo
+  const workspaceKey = 'developer'
 
   return (
     <div style={{ display: 'flex', minHeight: '100vh', background: 'var(--bg)' }}>

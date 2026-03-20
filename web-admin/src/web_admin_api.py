@@ -99,21 +99,14 @@ async def api_agent_health():
 
 @app.get("/api/agent/status")
 async def api_agent_status():
-    """Best-effort status for the right pane."""
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        r = await client.get(f"{AGENT_URL}/autonomous/capabilities")
-    if r.status_code >= 400:
-        return {"status": "unknown", "detail": "capabilities unavailable"}
-    return r.json()
+    """ADA v1: estado mínimo sin depender de endpoints autónomos legacy."""
+    return {"status": "ok", "ada_v1": True, "model_hint": "ollama_local"}
 
 
 @app.get("/api/autonomous/plan")
 async def api_autonomous_plan():
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        r = await client.get(f"{AGENT_URL}/autonomous/plan")
-    if r.status_code >= 400:
-        return {"plan": None}
-    return r.json()
+    # Legacy desactivado en ADA v1; no exponer planes de negocio/autonomía por defecto.
+    return {"status": "disabled_v1", "plan": None, "step_statuses": []}
 
 
 @app.post("/api/execute_plan")
@@ -130,29 +123,17 @@ async def api_execute_plan(body: dict):
 
 @app.get("/api/system/monitor")
 async def api_system_monitor():
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        r = await client.get(f"{AGENT_URL}/system/monitor")
-    if r.status_code >= 400:
-        return {"error": "Monitor unavailable", "agents": []}
-    return r.json()
+    return {"status": "disabled_v1", "agents": []}
 
 
 @app.get("/api/agent_market/proposals")
 async def api_agent_market_proposals(status: Optional[str] = None):
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        r = await client.get(f"{AGENT_URL}/agent_market/proposals", params={"status": status} if status else {})
-    if r.status_code >= 400:
-        return {"proposals": []}
-    return r.json()
+    return {"status": "disabled_v1", "proposals": []}
 
 
 @app.post("/api/agent_market/propose")
 async def api_agent_market_propose(body: dict):
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        r = await client.post(f"{AGENT_URL}/agent_market/propose", json=body)
-    if r.status_code >= 400:
-        raise HTTPException(status_code=r.status_code, detail=r.text[:1000])
-    return r.json()
+    raise HTTPException(status_code=410, detail="Agent market desactivado en ADA v1.")
 
 
 # -----------------------

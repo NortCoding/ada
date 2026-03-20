@@ -1,0 +1,90 @@
+# ADA — servicios fuera del núcleo v1 (legacy / opcionales).
+# No se cargan salvo que combines explícitamente este archivo.
+#
+# Telegram:
+#   docker compose -f docker-compose.yml -f docker-compose.legacy.yml --profile telegram up -d
+#
+# Logging + task-runner + orchestrator + ALMA + stub web-search:
+#   docker compose -f docker-compose.yml -f docker-compose.legacy.yml --profile legacy up -d
+
+services:
+  chat-bridge:
+    build: ./chat-bridge
+    container_name: ada_chat_bridge
+    environment:
+      AGENT_URL: http://agent-core:3001
+      MEMORY_URL: http://memory_service:3005
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    depends_on:
+      - agent-core
+    ports:
+      - "8081:8081"
+    profiles:
+      - telegram
+
+  logging-system:
+    build: ./logging-system
+    container_name: ada_logging
+    profiles: ["legacy"]
+    environment:
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_USER: ${PG_USER:-ada_user}
+      PG_PASSWORD: ${PG_PASSWORD:-supersecret}
+      PG_DB: ${PG_DB:-ada_main}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "3006:3006"
+
+  task-runner:
+    build: ./task-runner
+    container_name: ada_task_runner
+    profiles: ["legacy"]
+    environment:
+      LOG_URL: http://logging-system:3006/log
+    depends_on:
+      - logging-system
+    ports:
+      - "3003:3003"
+    volumes:
+      - ${ADA_WORKSPACE:-/Volumes/Datos/dockers/ADA/workspace}:/app/workspace
+
+  web-search:
+    image: curlimages/curl:latest
+    container_name: ada_web_search
+    profiles: ["legacy"]
+    command: sleep infinity
+    ports:
+      - "3009:3009"
+    volumes:
+      - .:/workspace
+
+  autonomous-orchestrator:
+    build: ./autonomous-orchestrator
+    container_name: ada_orchestrator
+    profiles: ["legacy"]
+    command: python orchestrator_6h.py
+    environment:
+      AGENT_URL: http://agent-core:3001
+      MEMORY_URL: http://memory_service:3005
+      LOG_URL: http://logging-system:3006/log
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    depends_on:
+      - agent-core
+      - memory_service
+      - logging-system
+    ports:
+      - "3010:3010"
+    volumes:
+      - .:/workspace
+
+  agent-alma:
+    build: ./agents/ALMA
+    container_name: ada_alma
+    profiles: ["legacy"]
+    ports:
+      - "3011:3011"

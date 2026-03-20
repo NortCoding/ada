@@ -1,13 +1,12 @@
-# ADA v2 Minimal Core
-# Base: Ollama (gratis, local). Máximo uso de local; Gemini (pago) solo si use_advanced_brain=true o se necesita más.
+# ADA v1 — núcleo mínimo
+# Arranque: docker compose up -d
 #
-# Servicios que arrancan con "docker compose up -d" (sin perfiles):
-#   - postgres, agent-core, memory_service, chat_interface
-# Servicios con perfil (no arrancan por defecto):
-#   - chat-bridge (perfil "telegram"): docker compose --profile telegram up -d
-# Si ves más contenedores, comprueba que no tengas COMPOSE_PROFILES en el entorno.
-# Ollama corre en el host (Mac), no en Docker.
-# Usage: docker compose up -d
+# Servicios activos: postgres, memory_service, agent-core, chat_interface
+# Ollama en el host (p. ej. host.docker.internal:11434).
+#
+# Servicios históricos (telegram, orchestrator, task-runner, etc.):
+#   docker compose -f docker-compose.yml -f docker-compose.legacy.yml --profile telegram up -d
+#   docker compose -f docker-compose.yml -f docker-compose.legacy.yml --profile legacy up -d
 
 services:
   postgres:
@@ -32,7 +31,6 @@ services:
     build: ./agent-core
     container_name: ada_core
     env_file: ada_resources.env
-    # Cerebro base: Ollama (OLLAMA_URL al host). Gemini opcional con GEMINI_API_KEY + use_advanced_brain.
     environment:
       MEMORY_URL: http://memory_service:3005
       PG_HOST: postgres
@@ -46,20 +44,12 @@ services:
       OLLAMA_VISION_MODEL: ${OLLAMA_VISION_MODEL:-}
       OLLAMA_CHAT_TIMEOUT: ${OLLAMA_CHAT_TIMEOUT:-180}
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.0-flash}
-      MOLTBOT_URL: ${MOLTBOT_URL:-http://moltbot:3010/execute}
-      ADA_EMAIL: ${ADA_EMAIL:-}
-      ADA_EMAIL_PASSWORD: ${ADA_EMAIL_PASSWORD:-}
       ADA_ENV: ${ADA_ENV:-development}
-      ADA_DIRECT_EXECUTE: ${ADA_DIRECT_EXECUTE:-true}
-      CHAT_BRIDGE_URL: ${CHAT_BRIDGE_URL:-http://chat-bridge:8081}
-      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       ADA_WORKSPACE: ${ADA_WORKSPACE:-/workspace}
       ADA_PROJECTS_ROOT: ${ADA_PROJECTS_ROOT:-/dockers}
-      ADA_ALLOW_RUN_COMMAND: ${ADA_ALLOW_RUN_COMMAND:-}
+      ADA_ALLOW_RUN_COMMAND: ${ADA_ALLOW_RUN_COMMAND:-1}
       ADA_RUN_COMMAND_ALLOWLIST: ${ADA_RUN_COMMAND_ALLOWLIST:-}
       ADA_RUN_COMMAND_TIMEOUT: ${ADA_RUN_COMMAND_TIMEOUT:-60}
-      ADA_SCHEDULER_INTERVAL_SEC: ${ADA_SCHEDULER_INTERVAL_SEC:-3600}
-      TASK_URL: ${TASK_URL:-http://task-runner:3003/execute}
     ports:
       - "3001:3001"
     volumes:
@@ -94,9 +84,7 @@ services:
     environment:
       AGENT_URL: http://agent-core:3001
       MEMORY_URL: http://memory_service:3005
-      # Raíz del explorador de archivos (ruta dentro del contenedor). Debe coincidir con el volumen /dockers.
       ADA_FILES_ROOT: /dockers
-      # Permitir crear/editar archivos desde la interfaz en esa raíz (1 = sí).
       ENABLE_AGENT_FS: ${ENABLE_AGENT_FS:-1}
     depends_on:
       - agent-core
@@ -106,150 +94,7 @@ services:
     volumes:
       - ./web-admin/src:/app
       - ./web-admin/frontend/dist:/frontend/dist
-      # Directorio que el usuario asignó (p. ej. /Volumes/Datos/dockers) para que ARCHIVOS liste sus proyectos
       - ${ADA_PROJECTS_PATH:-/Volumes/Datos/dockers}:/dockers
-
-  chat-bridge:
-    build: ./chat-bridge
-    container_name: ada_chat_bridge
-    environment:
-      AGENT_URL: http://agent-core:3001
-      MEMORY_URL: http://memory_service:3005
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
-      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
-    depends_on:
-      - agent-core
-    ports:
-      - "8081:8081"
-    profiles:
-      - telegram
-
-  # --- Extended profile (temporalmente deshabilitados) ---
-  logging-system:
-    build: ./logging-system
-    container_name: ada_logging
-    environment:
-      PG_HOST: postgres
-      PG_PORT: 5432
-      PG_USER: ${PG_USER:-ada_user}
-      PG_PASSWORD: ${PG_PASSWORD:-supersecret}
-      PG_DB: ${PG_DB:-ada_main}
-    depends_on:
-      postgres:
-        condition: service_healthy
-    ports:
-      - "3006:3006"
-
-  # policy-engine:
-  #   build: ./policy-engine
-  #   container_name: ada_policy
-  #   profiles:
-  #     - extended
-  #   environment:
-  #     PG_HOST: postgres
-  #     PG_PORT: 5432
-  #     PG_USER: ${PG_USER:-ada_user}
-  #     PG_PASSWORD: ${PG_PASSWORD:-supersecret}
-  #     PG_DB: ${PG_DB:-ada_main}
-  #   depends_on:
-  #     postgres:
-  #       condition: service_healthy
-  #   ports:
-  #     - "3008:3008"
-
-  # simulation-engine:
-  #   build: ./simulation-engine
-  #   container_name: ada_simulation
-  #   profiles:
-  #     - extended
-  #   ports:
-  #     - "3007:3007"
-
-  task-runner:
-    build: ./task-runner
-    container_name: ada_task_runner
-    environment:
-      LOG_URL: http://logging-system:3006/log
-    depends_on:
-      - logging-system
-    ports:
-      - "3003:3003"
-    volumes:
-      - ${ADA_WORKSPACE:-/Volumes/Datos/dockers/ADA/workspace}:/app/workspace
-
-  web-search:
-    image: curlimages/curl:latest
-    container_name: ada_web_search
-    command: sleep infinity
-    ports:
-      - "3009:3009"
-    volumes:
-      - .:/workspace
-
-  autonomous-orchestrator:
-    build: ./autonomous-orchestrator
-    container_name: ada_orchestrator
-    command: python orchestrator_6h.py
-    environment:
-      AGENT_URL: http://agent-core:3001
-      MEMORY_URL: http://memory_service:3005
-      LOG_URL: http://logging-system:3006
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
-      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
-    depends_on:
-      - agent-core
-      - memory_service
-      - logging-system
-    ports:
-      - "3010:3010"
-    volumes:
-      - .:/workspace
-
-  # financial-ledger:
-  #   build: ./financial-ledger
-  #   container_name: ada_financial_ledger
-  #   profiles:
-  #     - extended
-  #   environment:
-  #     PG_HOST: postgres
-  #     PG_PORT: 5432
-  #     PG_USER: ${PG_USER:-ada_user}
-  #     PG_PASSWORD: ${PG_PASSWORD:-supersecret}
-  #     PG_DB: ${PG_DB:-ada_main}
-  #     LOG_URL: http://logging-system:3006/log
-  #   depends_on:
-  #     postgres:
-  #       condition: service_healthy
-  #     logging-system:
-  #       condition: service_started
-  #   ports:
-  #     - "3004:3004"
-
-  # n8n:
-  #   image: n8nio/n8n:latest
-  #   container_name: ada_n8n
-  #   profiles:
-  #     - extended
-  #   restart: always
-  #   ports:
-  #     - "5678:5678"
-  #   environment:
-  #     - N8N_HOST=localhost
-  #     - N8N_PORT=5678
-  #     - N8N_PROTOCOL=http
-  #     - NODE_ENV=production
-  #     - WEBHOOK_URL=http://localhost:5678/
-  #     - GENERIC_TIMEZONE=Europe/Madrid
-  #   volumes:
-  #     - n8n-data:/home/node/.n8n
-
-
-  agent-alma:
-    build: ./agents/ALMA
-    container_name: ada_alma
-    ports:
-      - "3011:3011"
 
 volumes:
   pg-data:
-  # n8n-data:  # descomentar si vuelves a habilitar n8n

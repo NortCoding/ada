@@ -40,7 +40,7 @@ export default function TopStatusBar({ currentProject = 'ADA', workspaceKey = 'd
   const activeModel = useMemo(() => {
     const d = agentStatus
     if (!d || typeof d !== 'object') return 'unknown'
-    return d.model || d.active_model || d.ollama_model || 'unknown'
+    return d.model || d.model_hint || d.active_model || d.ollama_model || 'unknown'
   }, [agentStatus])
 
   const statusDot = agentConnected ? 'var(--success)' : 'var(--danger)'

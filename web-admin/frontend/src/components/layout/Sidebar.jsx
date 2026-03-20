@@ -18,17 +18,12 @@ export default function Sidebar() {
   return (
     <aside className="pane" style={{ width: 280, borderRight: '1px solid var(--border)', padding: 14, gap: 10 }}>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 4, padding: '6px 6px 14px 6px' }}>
-        <div style={{ fontSize: '1.1rem', fontWeight: 800 }}>ADA Front v2</div>
-        <div style={{ fontSize: '0.85rem', color: 'var(--subtle)' }}>Control layer (CLI-first)</div>
+        <div style={{ fontSize: '1.1rem', fontWeight: 800 }}>ADA v1</div>
+        <div style={{ fontSize: '0.85rem', color: 'var(--subtle)' }}>Desarrollo</div>
       </div>
 
       <nav style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-        <NavLink to="/v2" end style={linkStyle}>🏠 Home</NavLink>
-        <NavLink to="/v2/developer" style={linkStyle}>💻 Developer</NavLink>
-        <NavLink to="/v2/business" style={linkStyle}>📈 Business</NavLink>
-        <NavLink to="/v2/research" style={linkStyle}>🔬 Research</NavLink>
-        <NavLink to="/v2/roadmap" style={linkStyle}>🧭 Roadmap</NavLink>
-        <NavLink to="/v2/monitor" style={linkStyle}>🖥️ Monitor</NavLink>
+        <NavLink to="/v2/developer" style={linkStyle}>💻 Workspace</NavLink>
       </nav>
 
       <div style={{ marginTop: 'auto', paddingTop: 14, fontSize: '0.8rem', color: 'var(--subtle)' }}>
